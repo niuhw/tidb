@@ -14,22 +14,20 @@
 package mocktikv
 
 import (
-	"time"
+	"context"
 
 	"github.com/golang/protobuf/proto"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/coprocessor"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	tipb "github.com/pingcap/tipb/go-tipb"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tipb/go-tipb"
 )
 
 func (h *rpcHandler) handleCopAnalyzeRequest(req *coprocessor.Request) *coprocessor.Response {
@@ -92,13 +90,13 @@ func (h *rpcHandler) handleAnalyzeIndexReq(req *coprocessor.Request, analyzeReq 
 		var value []byte
 		for _, val := range values {
 			value = append(value, val...)
+			if cms != nil {
+				cms.InsertBytes(value)
+			}
 		}
 		err = statsBuilder.Iterate(types.NewBytesDatum(value))
 		if err != nil {
 			return nil, errors.Trace(err)
-		}
-		if cms != nil {
-			cms.InsertBytes(value)
 		}
 	}
 	hg := statistics.HistogramToProto(statsBuilder.Hist())
@@ -118,9 +116,13 @@ type analyzeColumnsExec struct {
 	fields  []*ast.ResultField
 }
 
-func (h *rpcHandler) handleAnalyzeColumnsReq(req *coprocessor.Request, analyzeReq *tipb.AnalyzeReq) (*coprocessor.Response, error) {
+func (h *rpcHandler) handleAnalyzeColumnsReq(req *coprocessor.Request, analyzeReq *tipb.AnalyzeReq) (_ *coprocessor.Response, err error) {
 	sc := flagsToStatementContext(analyzeReq.Flags)
-	sc.TimeZone = time.FixedZone("UTC", int(analyzeReq.TimeZoneOffset))
+	sc.TimeZone, err = constructTimeZone("", int(analyzeReq.TimeZoneOffset))
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
 	evalCtx := &evalContext{sc: sc}
 	columns := analyzeReq.ColReq.ColumnsInfo
 	evalCtx.setColumnInfo(columns)
@@ -142,7 +144,7 @@ func (h *rpcHandler) handleAnalyzeColumnsReq(req *coprocessor.Request, analyzeRe
 	for i := range e.fields {
 		rf := new(ast.ResultField)
 		rf.Column = new(model.ColumnInfo)
-		rf.Column.FieldType = types.FieldType{Tp: mysql.TypeBlob, Flen: mysql.MaxBlobWidth, Charset: charset.CharsetUTF8, Collate: charset.CollationUTF8}
+		rf.Column.FieldType = types.FieldType{Tp: mysql.TypeBlob, Flen: mysql.MaxBlobWidth, Charset: mysql.DefaultCharset, Collate: mysql.DefaultCollationName}
 		e.fields[i] = rf
 	}
 
@@ -186,7 +188,7 @@ func (h *rpcHandler) handleAnalyzeColumnsReq(req *coprocessor.Request, analyzeRe
 	return &coprocessor.Response{Data: data}, nil
 }
 
-// Fields implements the ast.RecordSet Fields interface.
+// Fields implements the sqlexec.RecordSet Fields interface.
 func (e *analyzeColumnsExec) Fields() []*ast.ResultField {
 	return e.fields
 }
@@ -227,10 +229,10 @@ func (e *analyzeColumnsExec) NewChunk() *chunk.Chunk {
 	for _, field := range e.fields {
 		fields = append(fields, &field.Column.FieldType)
 	}
-	return chunk.NewChunk(fields)
+	return chunk.NewChunkWithCapacity(fields, 1)
 }
 
-// Close implements the ast.RecordSet Close interface.
+// Close implements the sqlexec.RecordSet Close interface.
 func (e *analyzeColumnsExec) Close() error {
 	return nil
 }

@@ -14,6 +14,7 @@
 package structure_test
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/pingcap/check"
@@ -21,7 +22,6 @@ import (
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/structure"
 	"github.com/pingcap/tidb/util/testleak"
-	"golang.org/x/net/context"
 )
 
 func TestTxStructure(t *testing.T) {
@@ -45,7 +45,7 @@ func (s *testTxStructureSuite) SetUpSuite(c *C) {
 func (s *testTxStructureSuite) TearDownSuite(c *C) {
 	err := s.store.Close()
 	c.Assert(err, IsNil)
-	testleak.AfterTest(c)
+	testleak.AfterTest(c)()
 }
 
 func (s *testTxStructureSuite) TestString(c *C) {

@@ -16,16 +16,16 @@ package expression
 import (
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
-	"github.com/pingcap/tidb/util/charset"
+	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
-	tipb "github.com/pingcap/tipb/go-tipb"
+	"github.com/pingcap/tipb/go-tipb"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -59,7 +59,7 @@ func ExpressionsToPB(sc *stmtctx.StatementContext, exprs []Expression, client kv
 			Tp:        tipb.ExprType_ScalarFunc,
 			Sig:       tipb.ScalarFuncSig_LogicalAnd,
 			Children:  []*tipb.Expr{pbCNF, pbExpr},
-			FieldType: toPBFieldType(retTypeOfAnd),
+			FieldType: ToPBFieldType(retTypeOfAnd),
 		}
 	}
 	return
@@ -89,8 +89,8 @@ func NewPBConverter(client kv.Client, sc *stmtctx.StatementContext) PbConverter 
 // ExprToPB converts Expression to TiPB.
 func (pc PbConverter) ExprToPB(expr Expression) *tipb.Expr {
 	switch x := expr.(type) {
-	case *Constant:
-		return pc.constantToPBExpr(x)
+	case *Constant, *CorrelatedColumn:
+		return pc.conOrCorColToPBExpr(expr)
 	case *Column:
 		return pc.columnToPBExpr(x)
 	case *ScalarFunction:
@@ -99,18 +99,29 @@ func (pc PbConverter) ExprToPB(expr Expression) *tipb.Expr {
 	return nil
 }
 
-func (pc PbConverter) constantToPBExpr(con *Constant) *tipb.Expr {
-	var (
-		tp  tipb.ExprType
-		val []byte
-		ft  = con.GetType()
-	)
-	d, err := con.Eval(nil)
+func (pc PbConverter) conOrCorColToPBExpr(expr Expression) *tipb.Expr {
+	ft := expr.GetType()
+	d, err := expr.Eval(chunk.Row{})
 	if err != nil {
 		log.Errorf("Fail to eval constant, err: %s", err.Error())
 		return nil
 	}
+	tp, val, ok := pc.encodeDatum(d)
+	if !ok {
+		return nil
+	}
 
+	if !pc.client.IsRequestTypeSupported(kv.ReqTypeSelect, int64(tp)) {
+		return nil
+	}
+	return &tipb.Expr{Tp: tp, Val: val, FieldType: ToPBFieldType(ft)}
+}
+
+func (pc *PbConverter) encodeDatum(d types.Datum) (tipb.ExprType, []byte, bool) {
+	var (
+		tp  tipb.ExprType
+		val []byte
+	)
 	switch d.Kind() {
 	case types.KindNull:
 		tp = tipb.ExprType_Null
@@ -137,7 +148,12 @@ func (pc PbConverter) constantToPBExpr(con *Constant) *tipb.Expr {
 		val = codec.EncodeInt(nil, int64(d.GetMysqlDuration().Duration))
 	case types.KindMysqlDecimal:
 		tp = tipb.ExprType_MysqlDecimal
-		val = codec.EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac())
+		var err error
+		val, err = codec.EncodeDecimal(nil, d.GetMysqlDecimal(), d.Length(), d.Frac())
+		if err != nil {
+			log.Errorf("Fail to encode value, err: %s", err.Error())
+			return tp, nil, false
+		}
 	case types.KindMysqlTime:
 		if pc.client.IsRequestTypeSupported(kv.ReqTypeDAG, int64(tipb.ExprType_MysqlTime)) {
 			tp = tipb.ExprType_MysqlTime
@@ -145,27 +161,25 @@ func (pc PbConverter) constantToPBExpr(con *Constant) *tipb.Expr {
 			t := d.GetMysqlTime()
 			if t.Type == mysql.TypeTimestamp && loc != time.UTC {
 				err := t.ConvertTimeZone(loc, time.UTC)
-				terror.Log(errors.Trace(err))
+				terror.Log(err)
 			}
 			v, err := t.ToPackedUint()
 			if err != nil {
 				log.Errorf("Fail to encode value, err: %s", err.Error())
-				return nil
+				return tp, nil, false
 			}
 			val = codec.EncodeUint(nil, v)
-			return &tipb.Expr{Tp: tp, Val: val, FieldType: toPBFieldType(ft)}
+			return tp, val, true
 		}
-		return nil
+		return tp, nil, false
 	default:
-		return nil
+		return tp, nil, false
 	}
-	if !pc.client.IsRequestTypeSupported(kv.ReqTypeSelect, int64(tp)) {
-		return nil
-	}
-	return &tipb.Expr{Tp: tp, Val: val, FieldType: toPBFieldType(ft)}
+	return tp, val, true
 }
 
-func toPBFieldType(ft *types.FieldType) *tipb.FieldType {
+// ToPBFieldType converts *types.FieldType to *tipb.FieldType.
+func ToPBFieldType(ft *types.FieldType) *tipb.FieldType {
 	return &tipb.FieldType{
 		Tp:      int32(ft.Tp),
 		Flag:    uint32(ft.Flag),
@@ -197,7 +211,7 @@ func (pc PbConverter) columnToPBExpr(column *Column) *tipb.Expr {
 		return &tipb.Expr{
 			Tp:        tipb.ExprType_ColumnRef,
 			Val:       codec.EncodeInt(nil, int64(column.Index)),
-			FieldType: toPBFieldType(column.RetType),
+			FieldType: ToPBFieldType(column.RetType),
 		}
 	}
 	id := column.ID
@@ -238,7 +252,7 @@ func (pc PbConverter) scalarFuncToPBExpr(expr *ScalarFunction) *tipb.Expr {
 		Tp:        tipb.ExprType_ScalarFunc,
 		Sig:       pbCode,
 		Children:  children,
-		FieldType: toPBFieldType(expr.RetType),
+		FieldType: ToPBFieldType(expr.RetType),
 	}
 }
 
@@ -281,12 +295,18 @@ func (pc PbConverter) canFuncBePushed(sf *ScalarFunction) bool {
 		ast.In,
 		ast.IsNull,
 		ast.Like,
+		ast.IsTruth,
+		ast.IsFalsity,
 
 		// arithmetical functions.
 		ast.Plus,
 		ast.Minus,
 		ast.Mul,
 		ast.Div,
+		ast.Abs,
+		ast.Ceil,
+		ast.Ceiling,
+		ast.Floor,
 
 		// control flow functions.
 		ast.Case,

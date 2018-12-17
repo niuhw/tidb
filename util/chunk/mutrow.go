@@ -18,7 +18,7 @@ import (
 	"math"
 	"unsafe"
 
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/hack"
@@ -40,7 +40,7 @@ func (mr MutRow) Len() int {
 
 // MutRowFromValues creates a MutRow from a interface slice.
 func MutRowFromValues(vals ...interface{}) MutRow {
-	c := &Chunk{}
+	c := &Chunk{columns: make([]*column, 0, len(vals))}
 	for _, val := range vals {
 		col := makeMutRowColumn(val)
 		c.columns = append(c.columns, col)
@@ -50,7 +50,7 @@ func MutRowFromValues(vals ...interface{}) MutRow {
 
 // MutRowFromDatums creates a MutRow from a datum slice.
 func MutRowFromDatums(datums []types.Datum) MutRow {
-	c := &Chunk{}
+	c := &Chunk{columns: make([]*column, 0, len(datums))}
 	for _, d := range datums {
 		col := makeMutRowColumn(d.GetValue())
 		c.columns = append(c.columns, col)
@@ -60,7 +60,7 @@ func MutRowFromDatums(datums []types.Datum) MutRow {
 
 // MutRowFromTypes creates a MutRow from a FieldType slice, each column is initialized to zero value.
 func MutRowFromTypes(types []*types.FieldType) MutRow {
-	c := &Chunk{}
+	c := &Chunk{columns: make([]*column, 0, len(types))}
 	for _, tp := range types {
 		col := makeMutRowColumn(zeroValForType(tp))
 		c.columns = append(c.columns, col)
@@ -345,4 +345,27 @@ func setMutRowJSON(col *column, j json.BinaryJSON) {
 	col.data[0] = j.TypeCode
 	copy(col.data[1:], j.Value)
 	col.offsets[1] = int32(dataLen)
+}
+
+// ShallowCopyPartialRow shallow copies the data of `row` to MutRow.
+func (mr MutRow) ShallowCopyPartialRow(colIdx int, row Row) {
+	for i, srcCol := range row.c.columns {
+		dstCol := mr.c.columns[colIdx+i]
+		if !srcCol.isNull(row.idx) {
+			// MutRow only contains one row, so we can directly set the whole byte.
+			dstCol.nullBitmap[0] = 1
+		} else {
+			dstCol.nullBitmap[0] = 0
+		}
+
+		if srcCol.isFixed() {
+			elemLen := len(srcCol.elemBuf)
+			offset := row.idx * elemLen
+			dstCol.data = srcCol.data[offset : offset+elemLen]
+		} else {
+			start, end := srcCol.offsets[row.idx], srcCol.offsets[row.idx+1]
+			dstCol.data = srcCol.data[start:end]
+			dstCol.offsets[1] = int32(len(dstCol.data))
+		}
+	}
 }

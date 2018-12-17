@@ -14,9 +14,10 @@
 package mock
 
 import (
+	"context"
+
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tipb/go-tipb"
-	"golang.org/x/net/context"
 )
 
 // Client implement kv.Client interface, mocked from "CopClient" defined in
@@ -26,7 +27,7 @@ type Client struct {
 }
 
 // Send implement kv.Client interface.
-func (c *Client) Send(ctx context.Context, req *kv.Request) kv.Response {
+func (c *Client) Send(ctx context.Context, req *kv.Request, kv *kv.Variables) kv.Response {
 	return c.MockResponse
 }
 

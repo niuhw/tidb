@@ -14,13 +14,13 @@
 package ddl
 
 import (
+	"context"
 	"time"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/model"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/testleak"
-	"golang.org/x/net/context"
 )
 
 var _ = Suite(&testStatSuite{})
@@ -33,7 +33,7 @@ func (s *testStatSuite) SetUpSuite(c *C) {
 }
 
 func (s *testStatSuite) TearDownSuite(c *C) {
-	testleak.AfterTest(c)()
+	testleak.AfterTest(c, TestLeakCheckCnt)()
 }
 
 func (s *testStatSuite) getDDLSchemaVer(c *C, d *ddl) int64 {
@@ -84,7 +84,7 @@ LOOP:
 		case <-ticker.C:
 			d.close()
 			c.Assert(s.getDDLSchemaVer(c, d), GreaterEqual, ver)
-			d.start(context.Background())
+			d.restartWorkers(context.Background())
 			time.Sleep(time.Millisecond * 20)
 		case err := <-done:
 			c.Assert(err, IsNil)

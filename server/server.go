@@ -35,19 +35,20 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"net"
+	"net/http"
+	// For pprof
+	_ "net/http/pprof"
 	"sync"
 	"sync/atomic"
 	"time"
-	// For pprof
-	_ "net/http/pprof"
 
 	"github.com/blacktear23/go-proxyprotocol"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/util"
 	log "github.com/sirupsen/logrus"
 )
@@ -71,7 +72,7 @@ const defaultCapability = mysql.ClientLongPassword | mysql.ClientLongFlag |
 	mysql.ClientConnectWithDB | mysql.ClientProtocol41 |
 	mysql.ClientTransactions | mysql.ClientSecureConnection | mysql.ClientFoundRows |
 	mysql.ClientMultiStatements | mysql.ClientMultiResults | mysql.ClientLocalFiles |
-	mysql.ClientConnectAtts | mysql.ClientPluginAuth
+	mysql.ClientConnectAtts | mysql.ClientPluginAuth | mysql.ClientInteractive
 
 // Server is the MySQL protocol server
 type Server struct {
@@ -88,6 +89,7 @@ type Server struct {
 	// a supervisor automatically restart it, then new client connection will be created, but we can't server it.
 	// So we just stop the listener and store to force clients to chose other TiDB servers.
 	stopListenerCh chan struct{}
+	statusServer   *http.Server
 }
 
 // ConnectionCount gets current connection count.
@@ -100,7 +102,11 @@ func (s *Server) ConnectionCount() int {
 }
 
 func (s *Server) getToken() *Token {
-	return s.concurrentLimiter.Get()
+	start := time.Now()
+	tok := s.concurrentLimiter.Get()
+	// Note that data smaller than one microsecond is ignored, because that case can be viewed as non-block.
+	metrics.GetTokenDurationHistogram.Observe(float64(time.Since(start).Nanoseconds() / 1e3))
+	return tok
 }
 
 func (s *Server) releaseToken(token *Token) {
@@ -111,7 +117,6 @@ func (s *Server) releaseToken(token *Token) {
 // It allocates a connection ID and random salt data for authentication.
 func (s *Server) newConn(conn net.Conn) *clientConn {
 	cc := newClientConn(s)
-	log.Infof("[%d] new connection %s", cc.connectionID, conn.RemoteAddr().String())
 	if s.cfg.Performance.TCPKeepAlive {
 		if tcpConn, ok := conn.(*net.TCPConn); ok {
 			if err := tcpConn.SetKeepAlive(true); err != nil {
@@ -124,7 +129,7 @@ func (s *Server) newConn(conn net.Conn) *clientConn {
 	return cc
 }
 
-func (s *Server) skipAuth() bool {
+func (s *Server) isUnixSocket() bool {
 	return s.cfg.Socket != ""
 }
 
@@ -287,25 +292,29 @@ func (s *Server) Close() {
 		terror.Log(errors.Trace(err))
 		s.listener = nil
 	}
+	if s.statusServer != nil {
+		err := s.statusServer.Close()
+		terror.Log(errors.Trace(err))
+		s.statusServer = nil
+	}
 	metrics.ServerEventCounter.WithLabelValues(metrics.EventClose).Inc()
 }
 
 // onConn runs in its own goroutine, handles queries from this connection.
 func (s *Server) onConn(c net.Conn) {
 	conn := s.newConn(c)
-	defer func() {
-		log.Infof("[%d] close connection", conn.connectionID)
-	}()
-
 	if err := conn.handshake(); err != nil {
 		// Some keep alive services will send request to TiDB and disconnect immediately.
-		// So we use info log level.
-		log.Infof("handshake error %s", errors.ErrorStack(err))
+		// So we only record metrics.
+		metrics.HandShakeErrorCounter.Inc()
 		err = c.Close()
 		terror.Log(errors.Trace(err))
 		return
 	}
-
+	log.Infof("con:%d new connection %s", conn.connectionID, c.RemoteAddr().String())
+	defer func() {
+		log.Infof("con:%d close connection", conn.connectionID)
+	}()
 	s.rwlock.Lock()
 	s.clients[conn.connectionID] = conn
 	connections := len(s.clients)
@@ -316,14 +325,15 @@ func (s *Server) onConn(c net.Conn) {
 }
 
 // ShowProcessList implements the SessionManager interface.
-func (s *Server) ShowProcessList() []util.ProcessInfo {
-	var rs []util.ProcessInfo
+func (s *Server) ShowProcessList() map[uint64]util.ProcessInfo {
 	s.rwlock.RLock()
+	rs := make(map[uint64]util.ProcessInfo, len(s.clients))
 	for _, client := range s.clients {
 		if atomic.LoadInt32(&client.status) == connStatusWaitShutdown {
 			continue
 		}
-		rs = append(rs, client.ctx.ShowProcess())
+		pi := client.ctx.ShowProcess()
+		rs[pi.ID] = pi
 	}
 	s.rwlock.RUnlock()
 	return rs
@@ -341,17 +351,32 @@ func (s *Server) Kill(connectionID uint64, query bool) {
 		return
 	}
 
+	killConn(conn, query)
+}
+
+func killConn(conn *clientConn, query bool) {
+	if !query {
+		// Mark the client connection status as WaitShutdown, when the goroutine detect
+		// this, it will end the dispatch loop and exit.
+		atomic.StoreInt32(&conn.status, connStatusWaitShutdown)
+	}
+
 	conn.mu.RLock()
 	cancelFunc := conn.mu.cancelFunc
 	conn.mu.RUnlock()
 	if cancelFunc != nil {
 		cancelFunc()
 	}
+}
 
-	if !query {
-		// Mark the client connection status as WaitShutdown, when the goroutine detect
-		// this, it will end the dispatch loop and exit.
-		atomic.StoreInt32(&conn.status, connStatusWaitShutdown)
+// KillAllConnections kills all connections when server is not gracefully shutdown.
+func (s *Server) KillAllConnections() {
+	s.rwlock.Lock()
+	defer s.rwlock.Unlock()
+	log.Info("[server] kill all connections.")
+
+	for _, conn := range s.clients {
+		killConn(conn, false)
 	}
 }
 

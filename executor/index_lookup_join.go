@@ -14,18 +14,20 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"runtime"
 	"sort"
 	"sync"
+	"time"
 	"unsafe"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/expression"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/codec"
@@ -33,7 +35,6 @@ import (
 	"github.com/pingcap/tidb/util/mvmap"
 	"github.com/pingcap/tidb/util/ranger"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 var _ Executor = &IndexLookUpJoin{}
@@ -60,9 +61,9 @@ type IndexLookUpJoin struct {
 	joinResult *chunk.Chunk
 	innerIter  chunk.Iterator
 
-	resultGenerator joinResultGenerator
+	joiner joiner
 
-	indexRanges   []*ranger.NewRange
+	indexRanges   []*ranger.Range
 	keyOff2IdxOff []int
 	innerPtrBytes [][]byte
 
@@ -90,8 +91,9 @@ type lookUpJoinTask struct {
 	lookupMap         *mvmap.MVMap
 	matchedInners     []chunk.Row
 
-	doneCh chan error
-	cursor int
+	doneCh   chan error
+	cursor   int
+	hasMatch bool
 
 	memTracker *memory.Tracker // track memory usage.
 }
@@ -121,12 +123,31 @@ type innerWorker struct {
 	ctx         sessionctx.Context
 	executorChk *chunk.Chunk
 
-	indexRanges   []*ranger.NewRange
+	indexRanges   []*ranger.Range
 	keyOff2IdxOff []int
 }
 
 // Open implements the Executor interface.
 func (e *IndexLookUpJoin) Open(ctx context.Context) error {
+	// Be careful, very dirty hack in this line!!!
+	// IndexLookUpJoin need to rebuild executor (the dataReaderBuilder) during
+	// executing. However `executor.Next()` is lazy evaluation when the RecordSet
+	// result is drained.
+	// Lazy evaluation means the saved session context may change during executor's
+	// building and its running.
+	// A specific sequence for example:
+	//
+	// e := buildExecutor()   // txn at build time
+	// recordSet := runStmt(e)
+	// session.CommitTxn()    // txn closed
+	// recordSet.Next()
+	// e.dataReaderBuilder.Build() // txn is used again, which is already closed
+	//
+	// The trick here is `getStartTS` will cache start ts in the dataReaderBuilder,
+	// so even txn is destroyed later, the dataReaderBuilder could still use the
+	// cached start ts to construct DAG.
+	e.innerCtx.readerBuilder.getStartTS()
+
 	err := e.children[0].Open(ctx)
 	if err != nil {
 		return errors.Trace(err)
@@ -158,7 +179,7 @@ func (e *IndexLookUpJoin) newOuterWorker(resultCh, innerCh chan *lookUpJoinTask)
 		outerCtx:         e.outerCtx,
 		ctx:              e.ctx,
 		executor:         e.children[0],
-		executorChk:      chunk.NewChunk(e.outerCtx.rowTypes),
+		executorChk:      chunk.NewChunkWithCapacity(e.outerCtx.rowTypes, e.maxChunkSize),
 		resultCh:         resultCh,
 		innerCh:          innerCh,
 		batchSize:        32,
@@ -170,7 +191,7 @@ func (e *IndexLookUpJoin) newOuterWorker(resultCh, innerCh chan *lookUpJoinTask)
 
 func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWorker {
 	// Since multiple inner workers run concurrently, we should copy join's indexRanges for every worker to avoid data race.
-	copiedRanges := make([]*ranger.NewRange, 0, len(e.indexRanges))
+	copiedRanges := make([]*ranger.Range, 0, len(e.indexRanges))
 	for _, ran := range e.indexRanges {
 		copiedRanges = append(copiedRanges, ran.Clone())
 	}
@@ -179,7 +200,7 @@ func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWork
 		outerCtx:      e.outerCtx,
 		taskCh:        taskCh,
 		ctx:           e.ctx,
-		executorChk:   chunk.NewChunk(e.innerCtx.rowTypes),
+		executorChk:   chunk.NewChunkWithCapacity(e.innerCtx.rowTypes, e.maxChunkSize),
 		indexRanges:   copiedRanges,
 		keyOff2IdxOff: e.keyOff2IdxOff,
 	}
@@ -188,6 +209,10 @@ func (e *IndexLookUpJoin) newInnerWorker(taskCh chan *lookUpJoinTask) *innerWork
 
 // Next implements the Executor interface.
 func (e *IndexLookUpJoin) Next(ctx context.Context, chk *chunk.Chunk) error {
+	if e.runtimeStats != nil {
+		start := time.Now()
+		defer func() { e.runtimeStats.Record(time.Now().Sub(start), chk.NumRows()) }()
+	}
 	chk.Reset()
 	e.joinResult.Reset()
 	for {
@@ -205,16 +230,19 @@ func (e *IndexLookUpJoin) Next(ctx context.Context, chk *chunk.Chunk) error {
 		}
 
 		outerRow := task.outerResult.GetRow(task.cursor)
-		if e.innerIter.Len() == 0 {
-			err = e.resultGenerator.emit(outerRow, nil, chk)
-		} else if e.innerIter.Current() != e.innerIter.End() {
-			err = e.resultGenerator.emit(outerRow, e.innerIter, chk)
-		}
-		if err != nil {
-			return errors.Trace(err)
+		if e.innerIter.Current() != e.innerIter.End() {
+			matched, err := e.joiner.tryToMatch(outerRow, e.innerIter, chk)
+			if err != nil {
+				return errors.Trace(err)
+			}
+			task.hasMatch = task.hasMatch || matched
 		}
 		if e.innerIter.Current() == e.innerIter.End() {
+			if !task.hasMatch {
+				e.joiner.onMissMatch(outerRow, chk)
+			}
 			task.cursor++
+			task.hasMatch = false
 		}
 		if chk.NumRows() == e.maxChunkSize {
 			return nil
@@ -313,12 +341,12 @@ func (ow *outerWorker) pushToChan(ctx context.Context, task *lookUpJoinTask, dst
 // buildTask builds a lookUpJoinTask and read outer rows.
 // When err is not nil, task must not be nil to send the error to the main thread via task.
 func (ow *outerWorker) buildTask(ctx context.Context) (*lookUpJoinTask, error) {
-	ow.executor.newChunk()
+	ow.executor.newFirstChunk()
 
 	task := &lookUpJoinTask{
 		doneCh:            make(chan error, 1),
-		outerResult:       ow.executor.newChunk(),
-		encodedLookUpKeys: chunk.NewChunk([]*types.FieldType{types.NewFieldType(mysql.TypeBlob)}),
+		outerResult:       ow.executor.newFirstChunk(),
+		encodedLookUpKeys: chunk.NewChunkWithCapacity([]*types.FieldType{types.NewFieldType(mysql.TypeBlob)}, ow.ctx.GetSessionVars().MaxChunkSize),
 		lookupMap:         mvmap.NewMVMap(),
 	}
 	task.memTracker = memory.NewTracker(fmt.Sprintf("lookup join task %p", task), -1)
@@ -449,7 +477,12 @@ func (iw *innerWorker) constructDatumLookupKey(task *lookUpJoinTask, rowIdx int)
 	dLookupKey := make([]types.Datum, 0, keyLen)
 	for i, keyCol := range iw.outerCtx.keyCols {
 		outerValue := outerRow.GetDatum(keyCol, iw.outerCtx.rowTypes[keyCol])
-
+		// Join-on-condition can be promised to be equal-condition in
+		// IndexNestedLoopJoin, thus the filter will always be false if
+		// outerValue is null, and we don't need to lookup it.
+		if outerValue.IsNull() {
+			return nil, nil
+		}
 		innerColType := iw.rowTypes[iw.keyCols[i]]
 		innerValue, err := outerValue.ConvertTo(sc, innerColType)
 		if err != nil {
@@ -507,7 +540,7 @@ func (iw *innerWorker) fetchInnerResults(ctx context.Context, task *lookUpJoinTa
 		return errors.Trace(err)
 	}
 	defer terror.Call(innerExec.Close)
-	innerResult := chunk.NewList(innerExec.retTypes(), iw.ctx.GetSessionVars().MaxChunkSize)
+	innerResult := chunk.NewList(innerExec.retTypes(), iw.ctx.GetSessionVars().MaxChunkSize, iw.ctx.GetSessionVars().MaxChunkSize)
 	innerResult.GetMemTracker().SetLabel("inner result")
 	innerResult.GetMemTracker().AttachTo(task.memTracker)
 	for {
@@ -519,7 +552,7 @@ func (iw *innerWorker) fetchInnerResults(ctx context.Context, task *lookUpJoinTa
 			break
 		}
 		innerResult.Add(iw.executorChk)
-		iw.executorChk = chunk.NewChunk(iw.innerCtx.rowTypes)
+		iw.executorChk = innerExec.newFirstChunk()
 	}
 	task.innerResult = innerResult
 	return nil
@@ -532,6 +565,10 @@ func (iw *innerWorker) buildLookUpMap(task *lookUpJoinTask) error {
 		chk := task.innerResult.GetChunk(i)
 		for j := 0; j < chk.NumRows(); j++ {
 			innerRow := chk.GetRow(j)
+			if iw.hasNullInJoinKey(innerRow) {
+				continue
+			}
+
 			keyBuf = keyBuf[:0]
 			for _, keyCol := range iw.keyCols {
 				d := innerRow.GetDatum(keyCol, iw.rowTypes[keyCol])
@@ -547,6 +584,15 @@ func (iw *innerWorker) buildLookUpMap(task *lookUpJoinTask) error {
 		}
 	}
 	return nil
+}
+
+func (iw *innerWorker) hasNullInJoinKey(row chunk.Row) bool {
+	for _, ordinal := range iw.keyCols {
+		if row.IsNull(ordinal) {
+			return true
+		}
+	}
+	return false
 }
 
 // Close implements the Executor interface.

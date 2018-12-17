@@ -14,24 +14,23 @@
 package executor_test
 
 import (
+	"context"
 	"fmt"
 	"strconv"
-	"strings"
-	"time"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/plan"
-	"github.com/pingcap/tidb/privilege/privileges"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/session"
+	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/testkit"
 	"github.com/pingcap/tidb/util/testutil"
-	"golang.org/x/net/context"
 )
 
 func (s *testSuite) TestShow(c *C) {
@@ -53,7 +52,7 @@ func (s *testSuite) TestShow(c *C) {
 	row := result.Rows()[0]
 	// For issue https://github.com/pingcap/tidb/issues/1061
 	expectedRow := []interface{}{
-		"SHOW_test", "CREATE TABLE `SHOW_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `c1` int(11) DEFAULT NULL COMMENT 'c1_comment',\n  `c2` int(11) DEFAULT NULL,\n  `c3` int(11) DEFAULT '1',\n  `c4` text DEFAULT NULL,\n  `c5` tinyint(1) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_wide_c4` (`c3`,`c4`(10))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin AUTO_INCREMENT=28934 COMMENT='table_comment'"}
+		"SHOW_test", "CREATE TABLE `SHOW_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  `c1` int(11) DEFAULT NULL COMMENT 'c1_comment',\n  `c2` int(11) DEFAULT NULL,\n  `c3` int(11) DEFAULT '1',\n  `c4` text DEFAULT NULL,\n  `c5` tinyint(1) DEFAULT NULL,\n  PRIMARY KEY (`id`),\n  KEY `idx_wide_c4` (`c3`,`c4`(10))\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_INCREMENT=28934 COMMENT='table_comment'"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -73,7 +72,7 @@ func (s *testSuite) TestShow(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"ptest", "CREATE TABLE `ptest` (\n  `a` int(11) NOT NULL,\n  `b` double NOT NULL DEFAULT '2.0',\n  `c` varchar(10) NOT NULL,\n  `d` time DEFAULT NULL,\n  `e` timestamp NULL DEFAULT NULL,\n  `f` timestamp NULL DEFAULT NULL,\n  PRIMARY KEY (`a`),\n  UNIQUE KEY `d` (`d`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
+		"ptest", "CREATE TABLE `ptest` (\n  `a` int(11) NOT NULL,\n  `b` double NOT NULL DEFAULT '2.0',\n  `c` varchar(10) NOT NULL,\n  `d` time DEFAULT NULL,\n  `e` timestamp NULL DEFAULT NULL,\n  `f` timestamp NULL DEFAULT NULL,\n  PRIMARY KEY (`a`),\n  UNIQUE KEY `d` (`d`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -99,7 +98,38 @@ func (s *testSuite) TestShow(c *C) {
 			"  `c3` mediumint(8) UNSIGNED DEFAULT NULL,\n" +
 			"  `c4` int(10) UNSIGNED DEFAULT NULL,\n" +
 			"  `c5` bigint(20) UNSIGNED DEFAULT NULL\n" +
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
+	for i, r := range row {
+		c.Check(r, Equals, expectedRow[i])
+	}
+
+	// Issue #7665
+	tk.MustExec("drop table if exists `decimalschema`")
+	testSQL = "create table `decimalschema` (`c1` decimal);"
+	tk.MustExec(testSQL)
+	testSQL = "show create table decimalschema"
+	result = tk.MustQuery(testSQL)
+	c.Check(result.Rows(), HasLen, 1)
+	row = result.Rows()[0]
+	expectedRow = []interface{}{
+		"decimalschema", "CREATE TABLE `decimalschema` (\n" +
+			"  `c1` decimal(11,0) DEFAULT NULL\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
+	for i, r := range row {
+		c.Check(r, Equals, expectedRow[i])
+	}
+
+	tk.MustExec("drop table if exists `decimalschema`")
+	testSQL = "create table `decimalschema` (`c1` decimal(15));"
+	tk.MustExec(testSQL)
+	testSQL = "show create table decimalschema"
+	result = tk.MustQuery(testSQL)
+	c.Check(result.Rows(), HasLen, 1)
+	row = result.Rows()[0]
+	expectedRow = []interface{}{
+		"decimalschema", "CREATE TABLE `decimalschema` (\n" +
+			"  `c1` decimal(15,0) DEFAULT NULL\n" +
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -151,12 +181,24 @@ func (s *testSuite) TestShow(c *C) {
 	tk.MustQuery("SHOW PLUGINS").Check(testkit.Rows())
 	tk.MustQuery("SHOW PROFILES").Check(testkit.Rows())
 
+	// +-------------+--------------------+--------------+------------------+-------------------+
+	// | File        | Position           | Binlog_Do_DB | Binlog_Ignore_DB | Executed_Gtid_Set |
+	// +-------------+--------------------+--------------+------------------+-------------------+
+	// | tidb-binlog | 400668057259474944 |              |                  |                   |
+	// +-------------+--------------------+--------------+------------------+-------------------+
+	result = tk.MustQuery("SHOW MASTER STATUS")
+	c.Check(result.Rows(), HasLen, 1)
+	row = result.Rows()[0]
+	c.Check(row, HasLen, 5)
+
+	tk.MustQuery("SHOW PRIVILEGES")
+
 	// Test show create database
 	testSQL = `create database show_test_DB`
 	tk.MustExec(testSQL)
 	testSQL = "show create database show_test_DB;"
 	tk.MustQuery(testSQL).Check(testutil.RowsWithSep("|",
-		"show_test_DB|CREATE DATABASE `show_test_DB` /* !40100 DEFAULT CHARACTER SET utf8 */",
+		"show_test_DB|CREATE DATABASE `show_test_DB` /* !40100 DEFAULT CHARACTER SET utf8mb4 */",
 	))
 
 	tk.MustExec("use show_test_DB")
@@ -180,7 +222,7 @@ func (s *testSuite) TestShow(c *C) {
 			"show_auto_increment CREATE TABLE `show_auto_increment` (\n"+
 			"  `id` int(11) NOT NULL AUTO_INCREMENT,\n"+
 			"  PRIMARY KEY (`id`)\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin AUTO_INCREMENT=4",
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_INCREMENT=4",
 	))
 	// for issue https://github.com/pingcap/tidb/issues/4678
 	autoIDStep := autoid.GetStep()
@@ -191,7 +233,7 @@ func (s *testSuite) TestShow(c *C) {
 			"show_auto_increment CREATE TABLE `show_auto_increment` (\n"+
 			"  `id` int(11) NOT NULL AUTO_INCREMENT,\n"+
 			"  PRIMARY KEY (`id`)\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin AUTO_INCREMENT="+strconv.Itoa(int(autoID)),
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_INCREMENT="+strconv.Itoa(int(autoID)),
 	))
 	tk.MustExec(`drop table show_auto_increment`)
 	tk.MustExec(`create table show_auto_increment (id int primary key auto_increment)`)
@@ -200,7 +242,7 @@ func (s *testSuite) TestShow(c *C) {
 			"show_auto_increment CREATE TABLE `show_auto_increment` (\n"+
 			"  `id` int(11) NOT NULL AUTO_INCREMENT,\n"+
 			"  PRIMARY KEY (`id`)\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 	))
 	tk.MustExec("insert into show_auto_increment values(10)")
 	autoID = autoIDStep + 11
@@ -209,7 +251,7 @@ func (s *testSuite) TestShow(c *C) {
 			"show_auto_increment CREATE TABLE `show_auto_increment` (\n"+
 			"  `id` int(11) NOT NULL AUTO_INCREMENT,\n"+
 			"  PRIMARY KEY (`id`)\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin AUTO_INCREMENT="+strconv.Itoa(int(autoID)),
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin AUTO_INCREMENT="+strconv.Itoa(int(autoID)),
 	))
 
 	// Test show table with column's comment contain escape character
@@ -220,7 +262,7 @@ func (s *testSuite) TestShow(c *C) {
 		""+
 			"show_escape_character CREATE TABLE `show_escape_character` (\n"+
 			"  `id` int(11) DEFAULT NULL COMMENT 'a\\rb\\nc	d\\0ef'\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 	))
 
 	// for issue https://github.com/pingcap/tidb/issues/4424
@@ -234,7 +276,7 @@ func (s *testSuite) TestShow(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `a` varchar(10) DEFAULT NULL COMMENT 'a\\nb\\rc	d\\0e'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin COMMENT='a\\nb\\rc	d\\0e'"}
+		"show_test", "CREATE TABLE `show_test` (\n  `a` varchar(10) DEFAULT NULL COMMENT 'a\\nb\\rc	d\\0e'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMMENT='a\\nb\\rc	d\\0e'"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -250,7 +292,7 @@ func (s *testSuite) TestShow(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `a` varchar(10) DEFAULT 'a\\nb\\rc	d\\0e'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
+		"show_test", "CREATE TABLE `show_test` (\n  `a` varchar(10) DEFAULT 'a\\nb\\rc	d\\0e'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -269,7 +311,7 @@ func (s *testSuite) TestShow(c *C) {
 	c.Check(result.Rows(), HasLen, 1)
 	row = result.Rows()[0]
 	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `a` bit(1) DEFAULT NULL,\n  `b` bit(32) DEFAULT b'0',\n  `c` bit(1) DEFAULT b'1',\n  `d` bit(10) DEFAULT b'1010'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
+		"show_test", "CREATE TABLE `show_test` (\n  `a` bit(1) DEFAULT NULL,\n  `b` bit(32) DEFAULT b'0',\n  `c` bit(1) DEFAULT b'1',\n  `d` bit(10) DEFAULT b'1010'\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
 	}
@@ -297,7 +339,7 @@ func (s *testSuite) TestShow(c *C) {
 			"  `c` mediumint(9) DEFAULT NULL,\n" +
 			"  `d` int(11) DEFAULT NULL,\n" +
 			"  `e` bigint(20) DEFAULT NULL\n" +
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
 	}
 	for i, r := range row {
 		c.Check(r, Equals, expectedRow[i])
@@ -321,13 +363,99 @@ func (s *testSuite) TestShow(c *C) {
 	tk.MustQuery("show create table t").Check(testutil.RowsWithSep("|",
 		"t CREATE TABLE `t` (\n"+
 			"  `a` int(11) DEFAULT NULL\n"+
-			") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"+"\nPARTITION BY RANGE ( `a` ) (\n  PARTITION p0 VALUES LESS THAN 10,\n  PARTITION p1 VALUES LESS THAN 20,\n  PARTITION p2 VALUES LESS THAN MAXVALUE\n)",
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"+"\nPARTITION BY RANGE ( `a` ) (\n  PARTITION p0 VALUES LESS THAN (10),\n  PARTITION p1 VALUES LESS THAN (20),\n  PARTITION p2 VALUES LESS THAN (MAXVALUE)\n)",
+	))
+
+	tk.MustExec(`drop table if exists t`)
+	_, err := tk.Exec(`CREATE TABLE t (x int, y char) PARTITION BY RANGE(y) (
+ 	PARTITION p0 VALUES LESS THAN (10),
+ 	PARTITION p1 VALUES LESS THAN (20),
+ 	PARTITION p2 VALUES LESS THAN (MAXVALUE))`)
+	c.Assert(err, NotNil)
+
+	// Test range columns partition
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`CREATE TABLE t (a int, b int, c char, d int) PARTITION BY RANGE COLUMNS(a,d,c) (
+ 	PARTITION p0 VALUES LESS THAN (5,10,'ggg'),
+ 	PARTITION p1 VALUES LESS THAN (10,20,'mmm'),
+ 	PARTITION p2 VALUES LESS THAN (15,30,'sss'),
+        PARTITION p3 VALUES LESS THAN (50,MAXVALUE,MAXVALUE))`)
+	tk.MustQuery("show create table t").Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `a` int(11) DEFAULT NULL,\n"+
+			"  `b` int(11) DEFAULT NULL,\n"+
+			"  `c` char(1) DEFAULT NULL,\n"+
+			"  `d` int(11) DEFAULT NULL\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"+"\nPARTITION BY RANGE COLUMNS(a,d,c) (\n  PARTITION p0 VALUES LESS THAN (5,10,\"ggg\"),\n  PARTITION p1 VALUES LESS THAN (10,20,\"mmm\"),\n  PARTITION p2 VALUES LESS THAN (15,30,\"sss\"),\n  PARTITION p3 VALUES LESS THAN (50,MAXVALUE,MAXVALUE)\n)",
+	))
+
+	// Test hash partition
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`CREATE TABLE t (a int) PARTITION BY HASH(a) PARTITIONS 4`)
+	tk.MustQuery("show create table t").Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `a` int(11) DEFAULT NULL\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"+"\nPARTITION BY HASH( `a` )\nPARTITIONS 4",
+	))
+
+	// Test show create table compression type.
+	tk.MustExec(`drop table if exists t1`)
+	tk.MustExec(`CREATE TABLE t1 (c1 INT) COMPRESSION="zlib";`)
+	tk.MustQuery("show create table t1").Check(testutil.RowsWithSep("|",
+		"t1 CREATE TABLE `t1` (\n"+
+			"  `c1` int(11) DEFAULT NULL\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin COMPRESSION='zlib'",
+	))
+
+	// Test show create table year type
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t(y year unsigned signed zerofill zerofill, x int, primary key(y));`)
+	tk.MustQuery(`show create table t`).Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `y` year NOT NULL,\n"+
+			"  `x` int(11) DEFAULT NULL,\n"+
+			"  PRIMARY KEY (`y`)\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+
+	// Test show create table with zerofill flag
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t(id int primary key, val tinyint(10) zerofill);`)
+	tk.MustQuery(`show create table t`).Check(testutil.RowsWithSep("|",
+		"t CREATE TABLE `t` (\n"+
+			"  `id` int(11) NOT NULL,\n"+
+			"  `val` tinyint(10) UNSIGNED ZEROFILL DEFAULT NULL,\n"+
+			"  PRIMARY KEY (`id`)\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+
+	// Test show columns with different types of default value
+	tk.MustExec(`drop table if exists t`)
+	tk.MustExec(`create table t(
+		c0 int default 1,
+		c1 int default b'010',
+		c2 bigint default x'A7',
+		c3 bit(8) default b'00110001',
+		c4 varchar(6) default b'00110001',
+		c5 varchar(6) default '\'C6\'',
+		c6 enum('s', 'm', 'l', 'xl') default 'xl',
+		c7 set('a', 'b', 'c', 'd') default 'a,c,c',
+		c8 datetime default current_timestamp on update current_timestamp,
+		c9 year default '2014'
+	);`)
+	tk.MustQuery(`show columns from t`).Check(testutil.RowsWithSep("|",
+		"c0|int(11)|YES||1|",
+		"c1|int(11)|YES||2|",
+		"c2|bigint(20)|YES||167|",
+		"c3|bit(8)|YES||b'110001'|",
+		"c4|varchar(6)|YES||1|",
+		"c5|varchar(6)|YES||'C6'|",
+		"c6|enum('s','m','l','xl')|YES||xl|",
+		"c7|set('a','b','c','d')|YES||a,c,c|",
+		"c8|datetime|YES||CURRENT_TIMESTAMP|on update CURRENT_TIMESTAMP",
+		"c9|year|YES||2014|",
 	))
 }
 
 func (s *testSuite) TestShowVisibility(c *C) {
-	save := privileges.Enable
-	privileges.Enable = true
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("create database showdatabase")
 	tk.MustExec("use showdatabase")
@@ -365,9 +493,32 @@ func (s *testSuite) TestShowVisibility(c *C) {
 	rows := tk1.MustQuery("show databases").Rows()
 	c.Assert(len(rows), GreaterEqual, 2) // At least INFORMATION_SCHEMA and showdatabase
 
-	privileges.Enable = save
 	tk.MustExec(`drop user 'show'@'%'`)
 	tk.MustExec("drop database showdatabase")
+}
+
+func (s *testSuite) TestShowDatabasesInfoSchemaFirst(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustQuery("show databases").Check(testkit.Rows("INFORMATION_SCHEMA"))
+	tk.MustExec(`create user 'show'@'%'`)
+	tk.MustExec(`flush privileges`)
+
+	tk.MustExec(`create database AAAA`)
+	tk.MustExec(`create database BBBB`)
+	tk.MustExec(`grant select on AAAA.* to 'show'@'%'`)
+	tk.MustExec(`grant select on BBBB.* to 'show'@'%'`)
+	tk.MustExec(`flush privileges`)
+
+	tk1 := testkit.NewTestKit(c, s.store)
+	se, err := session.CreateSession4Test(s.store)
+	c.Assert(err, IsNil)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "show", Hostname: "%"}, nil, nil), IsTrue)
+	tk1.Se = se
+	tk1.MustQuery("show databases").Check(testkit.Rows("INFORMATION_SCHEMA", "AAAA", "BBBB"))
+
+	tk.MustExec(`drop user 'show'@'%'`)
+	tk.MustExec(`drop database AAAA`)
+	tk.MustExec(`drop database BBBB`)
 }
 
 // mockSessionManager is a mocked session manager that wraps one session
@@ -376,30 +527,8 @@ type mockSessionManager struct {
 	session.Session
 }
 
-// ShowProcessList implements the SessionManager.ShowProcessList interface.
-func (msm *mockSessionManager) ShowProcessList() []util.ProcessInfo {
-	return []util.ProcessInfo{msm.ShowProcess()}
-}
-
 // Kill implements the SessionManager.Kill interface.
 func (msm *mockSessionManager) Kill(cid uint64, query bool) {
-}
-
-func (s *testSuite) TestShowFullProcessList(c *C) {
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("select 1") // for tk.Se init
-
-	se := tk.Se
-	se.SetSessionManager(&mockSessionManager{se})
-
-	fullSQL := "show                                                                                        full processlist"
-	simpSQL := "show                                                                                        processlist"
-
-	cols := []int{4, 5, 6, 7} // columns to check: Command, Time, State, Info
-	tk.MustQuery(fullSQL).CheckAt(cols, testutil.RowsWithSep("|", "Query|0|2|"+fullSQL))
-	tk.MustQuery(simpSQL).CheckAt(cols, testutil.RowsWithSep("|", "Query|0|2|"+simpSQL[:100]))
-
-	se.SetSessionManager(nil) // reset sm so other tests won't use this
 }
 
 type stats struct {
@@ -417,95 +546,6 @@ func (s stats) Stats(vars *variable.SessionVars) (map[string]interface{}, error)
 	return m, nil
 }
 
-func (s *testSuite) TestForeignKeyInShowCreateTable(c *C) {
-	tk := testkit.NewTestKit(c, s.store)
-	tk.MustExec("use test")
-	testSQL := `drop table if exists show_test`
-	tk.MustExec(testSQL)
-	testSQL = `drop table if exists t1`
-	tk.MustExec(testSQL)
-	testSQL = `CREATE TABLE t1 (pk int PRIMARY KEY AUTO_INCREMENT)`
-	tk.MustExec(testSQL)
-
-	// For table with single fk.
-	sqlLines := []string{
-		"CREATE TABLE `show_test` (",
-		"  `id` int(11) NOT NULL AUTO_INCREMENT,",
-		"  PRIMARY KEY (`id`),",
-		"  CONSTRAINT `Fk` FOREIGN KEY (`id`) REFERENCES `t1` (`pk`) ON DELETE CASCADE ON UPDATE CASCADE",
-		") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
-	}
-	testSQL = strings.Join(sqlLines, "\n")
-	tk.MustExec(testSQL)
-	result := tk.MustQuery("show create table show_test;")
-	c.Check(result.Rows(), HasLen, 1)
-	row := result.Rows()[0]
-	expectedRow := []interface{}{"show_test", testSQL}
-	for i, r := range row {
-		c.Check(r, Equals, expectedRow[i])
-	}
-
-	// For table with multiple fk.
-	sqlLines = []string{
-		"CREATE TABLE `pilot_languages` (",
-		"  `pilot_id` int(11) NOT NULL,",
-		"  `language_id` int(11) NOT NULL,",
-		"  CONSTRAINT `pilot_language_fkey` FOREIGN KEY (`pilot_id`) REFERENCES `pilots` (`pilot_id`),",
-		"  CONSTRAINT `languages_fkey` FOREIGN KEY (`language_id`) REFERENCES `languages` (`language_id`)",
-		") ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin",
-	}
-	testSQL = strings.Join(sqlLines, "\n")
-	tk.MustExec(testSQL)
-	result = tk.MustQuery("show create table pilot_languages;")
-	c.Check(result.Rows(), HasLen, 1)
-	row = result.Rows()[0]
-	expectedRow = []interface{}{"pilot_languages", testSQL}
-	for i, r := range row {
-		c.Check(r, Equals, expectedRow[i])
-	}
-
-	testSQL = "alter table show_test drop foreign key `fk`"
-	tk.MustExec(testSQL)
-	testSQL = "show create table show_test;"
-	result = tk.MustQuery(testSQL)
-	c.Check(result.Rows(), HasLen, 1)
-	row = result.Rows()[0]
-	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
-	for i, r := range row {
-		c.Check(r, Equals, expectedRow[i])
-	}
-
-	testSQL = `CREATE TABLE followers (
-  f1 int NOT NULL REFERENCES user_profiles (uid),
-  f2 int NOT NULL REFERENCES user_profiles (uid),
-  PRIMARY KEY (f1,f2)
-);`
-	tk.MustExec(testSQL)
-	testSQL = "show create table followers;"
-	result = tk.MustQuery(testSQL)
-	c.Check(result.Rows(), HasLen, 1)
-	row = result.Rows()[0]
-	expectedRow = []interface{}{
-		"followers", "CREATE TABLE `followers` (\n  `f1` int(11) NOT NULL,\n  `f2` int(11) NOT NULL,\n" +
-			"  PRIMARY KEY (`f1`,`f2`)\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
-	for i, r := range row {
-		c.Check(r, Equals, expectedRow[i])
-	}
-
-	testSQL = "ALTER TABLE SHOW_TEST ADD CONSTRAINT `Fk` FOREIGN KEY (`id`) REFERENCES `t1` (`pk`) ON DELETE CASCADE ON UPDATE CASCADE\n "
-	tk.MustExec(testSQL)
-	testSQL = "show create table show_test;"
-	result = tk.MustQuery(testSQL)
-	c.Check(result.Rows(), HasLen, 1)
-	row = result.Rows()[0]
-	expectedRow = []interface{}{
-		"show_test", "CREATE TABLE `show_test` (\n  `id` int(11) NOT NULL AUTO_INCREMENT,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `Fk` FOREIGN KEY (`id`) REFERENCES `t1` (`pk`) ON DELETE CASCADE ON UPDATE CASCADE\n) ENGINE=InnoDB DEFAULT CHARSET=utf8 COLLATE=utf8_bin"}
-	for i, r := range row {
-		c.Check(r, Equals, expectedRow[i])
-	}
-}
-
 func (s *testSuite) TestShowWarnings(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	tk.MustExec("use test")
@@ -518,14 +558,42 @@ func (s *testSuite) TestShowWarnings(c *C) {
 	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Equals, uint16(0))
 	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", "Warning|1265|Data Truncated"))
 	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Equals, uint16(0))
+
+	// Test Warning level 'Error'
+	testSQL = `create table show_warnings (a int)`
+	tk.Exec(testSQL)
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Equals, uint16(1))
+	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", "Error|1050|Table 'test.show_warnings' already exists"))
+	tk.MustQuery("select @@error_count").Check(testutil.RowsWithSep("|", "1"))
+
+	// Test Warning level 'Note'
+	testSQL = `create table show_warnings_2 (a int)`
+	tk.MustExec(testSQL)
+	testSQL = `create table if not exists show_warnings_2 like show_warnings`
+	tk.Exec(testSQL)
+	c.Assert(tk.Se.GetSessionVars().StmtCtx.WarningCount(), Equals, uint16(1))
+	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", "Note|1050|Table 'test.show_warnings_2' already exists"))
+	tk.MustQuery("select @@warning_count").Check(testutil.RowsWithSep("|", "1"))
+	tk.MustQuery("select @@warning_count").Check(testutil.RowsWithSep("|", "0"))
+}
+
+func (s *testSuite) TestShowErrors(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	testSQL := `create table if not exists show_errors (a int)`
+	tk.MustExec(testSQL)
+	testSQL = `create table show_errors (a int)`
+	tk.Exec(testSQL)
+
+	tk.MustQuery("show errors").Check(testutil.RowsWithSep("|", "Error|1050|Table 'test.show_errors' already exists"))
 }
 
 func (s *testSuite) TestIssue3641(c *C) {
 	tk := testkit.NewTestKit(c, s.store)
 	_, err := tk.Exec("show tables;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
 	_, err = tk.Exec("show table status;")
-	c.Assert(err.Error(), Equals, plan.ErrNoDB.Error())
+	c.Assert(err.Error(), Equals, plannercore.ErrNoDB.Error())
 }
 
 // TestShow2 is moved from session_test
@@ -544,17 +612,21 @@ func (s *testSuite) TestShow2(c *C) {
 	tk.MustExec("drop table if exists t")
 	tk.MustExec(`create table if not exists t (c int) comment '注释'`)
 	tk.MustQuery(`show columns from t`).Check(testutil.RowsWithSep(",", "c,int(11),YES,,<nil>,"))
-
 	tk.MustQuery("show collation where Charset = 'utf8' and Collation = 'utf8_bin'").Check(testutil.RowsWithSep(",", "utf8_bin,utf8,83,,Yes,1"))
 
 	tk.MustQuery("show tables").Check(testkit.Rows("t"))
 	tk.MustQuery("show full tables").Check(testkit.Rows("t BASE TABLE"))
+	ctx := tk.Se.(sessionctx.Context)
+	is := domain.GetDomain(ctx).InfoSchema()
+	tblInfo, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
+	c.Assert(err, IsNil)
+	create_time := model.TSConvert2Time(tblInfo.Meta().UpdateTS).Format("2006-01-02 15:04:05")
+
+	// The Hostname is the actual host
+	tk.Se.Auth(&auth.UserIdentity{Username: "root", Hostname: "192.168.0.1", AuthUsername: "root", AuthHostname: "%"}, nil, []byte("012345678901234567890"))
 
 	r := tk.MustQuery("show table status from test like 't'")
-	timeStr := time.Now().Format("2006-01-02 15:04:05")
-	r.Check(testkit.Rows(fmt.Sprintf("t InnoDB 10 Compact 100 100 100 100 100 100 100 %s %s %s utf8_general_ci   注释", timeStr, timeStr, timeStr)))
-
-	tk.Se.Auth(&auth.UserIdentity{Username: "root", Hostname: "%"}, nil, []byte("012345678901234567890"))
+	r.Check(testkit.Rows(fmt.Sprintf("t InnoDB 10 Compact 0 0 0 0 0 0 0 %s <nil> <nil> utf8mb4_bin   注释", create_time)))
 
 	tk.MustQuery("show databases like 'test'").Check(testkit.Rows("test"))
 
@@ -563,6 +635,37 @@ func (s *testSuite) TestShow2(c *C) {
 
 	tk.MustQuery("show grants for current_user()").Check(testkit.Rows(`GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'`))
 	tk.MustQuery("show grants for current_user").Check(testkit.Rows(`GRANT ALL PRIVILEGES ON *.* TO 'root'@'%'`))
+}
+
+func (s *testSuite) TestUnprivilegedShow(c *C) {
+
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("CREATE DATABASE testshow")
+	tk.MustExec("USE testshow")
+	tk.MustExec("CREATE TABLE t1 (a int)")
+	tk.MustExec("CREATE TABLE t2 (a int)")
+
+	tk.MustExec(`CREATE USER 'lowprivuser'`) // no grants
+	tk.MustExec(`FLUSH PRIVILEGES`)
+
+	tk.Se.Auth(&auth.UserIdentity{Username: "lowprivuser", Hostname: "192.168.0.1", AuthUsername: "lowprivuser", AuthHostname: "%"}, nil, []byte("012345678901234567890"))
+	rs, err := tk.Exec("SHOW TABLE STATUS FROM testshow")
+	c.Assert(err, IsNil)
+	c.Assert(rs, NotNil)
+
+	tk.Se.Auth(&auth.UserIdentity{Username: "root", Hostname: "192.168.0.1", AuthUsername: "root", AuthHostname: "%"}, nil, []byte("012345678901234567890"))
+	tk.MustExec("GRANT ALL ON testshow.t1 TO 'lowprivuser'")
+	tk.MustExec(`FLUSH PRIVILEGES`)
+	tk.Se.Auth(&auth.UserIdentity{Username: "lowprivuser", Hostname: "192.168.0.1", AuthUsername: "lowprivuser", AuthHostname: "%"}, nil, []byte("012345678901234567890"))
+
+	ctx := tk.Se.(sessionctx.Context)
+	is := domain.GetDomain(ctx).InfoSchema()
+	tblInfo, err := is.TableByName(model.NewCIStr("testshow"), model.NewCIStr("t1"))
+	c.Assert(err, IsNil)
+	create_time := model.TSConvert2Time(tblInfo.Meta().UpdateTS).Format("2006-01-02 15:04:05")
+
+	tk.MustQuery("show table status from testshow").Check(testkit.Rows(fmt.Sprintf("t1 InnoDB 10 Compact 0 0 0 0 0 0 0 %s <nil> <nil> utf8mb4_bin   ", create_time)))
+
 }
 
 func (s *testSuite) TestCollation(c *C) {
@@ -587,6 +690,8 @@ func (s *testSuite) TestShowTableStatus(c *C) {
 	tk.MustExec(`drop table if exists t;`)
 	tk.MustExec(`create table t(a bigint);`)
 
+	tk.Se.Auth(&auth.UserIdentity{Username: "root", Hostname: "192.168.0.1", AuthUsername: "root", AuthHostname: "%"}, nil, []byte("012345678901234567890"))
+
 	// It's not easy to test the result contents because every time the test runs, "Create_time" changed.
 	tk.MustExec("show table status;")
 	rs, err := tk.Exec("show table status;")
@@ -604,4 +709,76 @@ func (s *testSuite) TestShowTableStatus(c *C) {
 		c.Assert(row.GetInt64(2), Equals, int64(10))
 		c.Assert(row.GetString(3), Equals, "Compact")
 	}
+	tk.MustExec(`drop table if exists tp;`)
+	tk.MustExec(`create table tp (a int)
+ 		partition by range(a)
+ 		( partition p0 values less than (10),
+		  partition p1 values less than (20),
+		  partition p2 values less than (maxvalue)
+  		);`)
+	rs, err = tk.Exec("show table status from test like 'tp';")
+	c.Assert(errors.ErrorStack(err), Equals, "")
+	rows, err = session.GetRows4Test(context.Background(), tk.Se, rs)
+	c.Assert(errors.ErrorStack(err), Equals, "")
+	c.Assert(rows[0].GetString(16), Equals, "partitioned")
+}
+
+func (s *testSuite) TestShowSlow(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	// The test result is volatile, because
+	// 1. Slow queries is stored in domain, which may be affected by other tests.
+	// 2. Collecting slow queries is a asynchronous process, check immediately may not get the expected result.
+	// 3. Make slow query like "select sleep(1)" would slow the CI.
+	// So, we just cover the code but do not check the result.
+	tk.MustQuery(`admin show slow recent 3`)
+	tk.MustQuery(`admin show slow top 3`)
+	tk.MustQuery(`admin show slow top internal 3`)
+	tk.MustQuery(`admin show slow top all 3`)
+}
+
+func (s *testSuite) TestShowEscape(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists `t``abl\"e`")
+	tk.MustExec("create table `t``abl\"e`(`c``olum\"n` int(11) primary key)")
+	tk.MustQuery("show create table `t``abl\"e`").Check(testutil.RowsWithSep("|",
+		""+
+			"t`abl\"e CREATE TABLE `t``abl\"e` (\n"+
+			"  `c``olum\"n` int(11) NOT NULL,\n"+
+			"  PRIMARY KEY (`c``olum\"n`)\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	))
+
+	// ANSI_QUOTES will change the SHOW output
+	tk.MustExec("set @old_sql_mode=@@sql_mode")
+	tk.MustExec("set sql_mode=ansi_quotes")
+	tk.MustQuery("show create table \"t`abl\"\"e\"").Check(testutil.RowsWithSep("|",
+		""+
+			"t`abl\"e CREATE TABLE \"t`abl\"\"e\" (\n"+
+			"  \"c`olum\"\"n\" int(11) NOT NULL,\n"+
+			"  PRIMARY KEY (\"c`olum\"\"n\")\n"+
+			") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin",
+	))
+
+	tk.MustExec("rename table \"t`abl\"\"e\" to t")
+	tk.MustExec("set sql_mode=@old_sql_mode")
+}
+
+func (s *testSuite) TestShowCreateTable(c *C) {
+	tk := testkit.NewTestKit(c, s.store)
+	tk.MustExec("use test")
+	tk.MustExec("drop table if exists t1,t2,t3")
+	tk.MustExec("create table t1 (a varchar(10));")
+	r := tk.MustQuery("show warnings")
+	c.Assert(len(r.Rows()), Equals, 0)
+	tk.MustExec("create table t2 (a varchar(10)) charset=UTF8mb4;")
+	r = tk.MustQuery("show warnings")
+	c.Assert(len(r.Rows()), Equals, 0)
+	tk.MustExec("create table t3 (a varchar(10)) charset=utf8;")
+	tk.MustQuery("show warnings").Check(testutil.RowsWithSep("|", `Warning|1105|TiDB only supports the "utf8mb4" character set, so "utf8" does not take effect.`))
+	tk.MustQuery("show create table t1;").Check(testutil.RowsWithSep("|", "t1|CREATE TABLE `t1` (\n  `a` varchar(10) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+	tk.MustQuery("show create table t2;").Check(testutil.RowsWithSep("|", "t2|CREATE TABLE `t2` (\n  `a` varchar(10) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+	tk.MustQuery("show create table t3;").Check(testutil.RowsWithSep("|", "t3|CREATE TABLE `t3` (\n  `a` varchar(10) DEFAULT NULL\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin"))
+	tk.MustExec("drop table t1,t2,t3")
 }

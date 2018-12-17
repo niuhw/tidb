@@ -14,6 +14,7 @@
 package mocktikv
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -118,7 +119,11 @@ func (s *testMockTiKVSuite) mustDeleteOK(c *C, key string, startTS, commitTS uin
 }
 
 func (s *testMockTiKVSuite) mustScanOK(c *C, start string, limit int, ts uint64, expect ...string) {
-	pairs := s.store.Scan([]byte(start), nil, limit, ts, kvrpcpb.IsolationLevel_SI)
+	s.mustRangeScanOK(c, start, "", limit, ts, expect...)
+}
+
+func (s *testMockTiKVSuite) mustRangeScanOK(c *C, start, end string, limit int, ts uint64, expect ...string) {
+	pairs := s.store.Scan([]byte(start), []byte(end), limit, ts, kvrpcpb.IsolationLevel_SI)
 	c.Assert(len(pairs)*2, Equals, len(expect))
 	for i := 0; i < len(pairs); i++ {
 		c.Assert(pairs[i].Err, IsNil)
@@ -128,7 +133,11 @@ func (s *testMockTiKVSuite) mustScanOK(c *C, start string, limit int, ts uint64,
 }
 
 func (s *testMockTiKVSuite) mustReverseScanOK(c *C, end string, limit int, ts uint64, expect ...string) {
-	pairs := s.store.ReverseScan(nil, []byte(end), limit, ts, kvrpcpb.IsolationLevel_SI)
+	s.mustRangeReverseScanOK(c, "", end, limit, ts, expect...)
+}
+
+func (s *testMockTiKVSuite) mustRangeReverseScanOK(c *C, start, end string, limit int, ts uint64, expect ...string) {
+	pairs := s.store.ReverseScan([]byte(start), []byte(end), limit, ts, kvrpcpb.IsolationLevel_SI)
 	c.Assert(len(pairs)*2, Equals, len(expect))
 	for i := 0; i < len(pairs); i++ {
 		c.Assert(pairs[i].Err, IsNil)
@@ -191,6 +200,27 @@ func (s *testMockTiKVSuite) TestGet(c *C) {
 	s.mustGetOK(c, "x", 11, "x")
 }
 
+func (s *testMockTiKVSuite) TestGetWithLock(c *C) {
+	key := "key"
+	value := "value"
+	s.mustPutOK(c, key, value, 5, 10)
+	mutations := []*kvrpcpb.Mutation{{
+		Op:  kvrpcpb.Op_Lock,
+		Key: []byte(key),
+	},
+	}
+	// test with lock's type is lock
+	s.mustPrewriteOK(c, mutations, key, 20)
+	s.mustGetOK(c, key, 25, value)
+	s.mustCommitOK(c, [][]byte{[]byte(key)}, 20, 30)
+
+	// test get with lock's max ts and primary key
+	s.mustPrewriteOK(c, putMutations(key, "value2", "key2", "v5"), key, 40)
+	s.mustGetErr(c, key, 41)
+	s.mustGetErr(c, "key2", math.MaxUint64)
+	s.mustGetOK(c, key, math.MaxUint64, "value")
+}
+
 func (s *testMockTiKVSuite) TestDelete(c *C) {
 	s.mustPutOK(c, "x", "x5-10", 5, 10)
 	s.mustDeleteOK(c, "x", 15, 20)
@@ -227,6 +257,9 @@ func (s *testMockTiKVSuite) TestReverseScan(c *C) {
 		s.mustReverseScanOK(c, "C\x00", 3, 10, "C", "C10", "A", "A10")
 		s.mustReverseScanOK(c, "C\x00", 4, 10, "C", "C10", "A", "A10")
 		s.mustReverseScanOK(c, "B", 1, 10, "A", "A10")
+		s.mustRangeReverseScanOK(c, "", "E", 5, 10, "C", "C10", "A", "A10")
+		s.mustRangeReverseScanOK(c, "", "C\x00", 5, 10, "C", "C10", "A", "A10")
+		s.mustRangeReverseScanOK(c, "A\x00", "C", 5, 10)
 	}
 	checkV10()
 
@@ -238,6 +271,9 @@ func (s *testMockTiKVSuite) TestReverseScan(c *C) {
 		s.mustReverseScanOK(c, "Z", 5, 20, "E", "E10", "D", "D20", "C", "C10", "B", "B20", "A", "A10")
 		s.mustReverseScanOK(c, "C\x00", 5, 20, "C", "C10", "B", "B20", "A", "A10")
 		s.mustReverseScanOK(c, "A\x00", 1, 20, "A", "A10")
+		s.mustRangeReverseScanOK(c, "B", "D", 5, 20, "C", "C10", "B", "B20")
+		s.mustRangeReverseScanOK(c, "B", "D\x00", 5, 20, "D", "D20", "C", "C10", "B", "B20")
+		s.mustRangeReverseScanOK(c, "B\x00", "D\x00", 5, 20, "D", "D20", "C", "C10")
 	}
 	checkV10()
 	checkV20()
@@ -286,6 +322,9 @@ func (s *testMockTiKVSuite) TestScan(c *C) {
 		s.mustScanOK(c, "A\x00", 3, 10, "C", "C10", "E", "E10")
 		s.mustScanOK(c, "C", 4, 10, "C", "C10", "E", "E10")
 		s.mustScanOK(c, "F", 1, 10)
+		s.mustRangeScanOK(c, "", "E", 5, 10, "A", "A10", "C", "C10")
+		s.mustRangeScanOK(c, "", "C\x00", 5, 10, "A", "A10", "C", "C10")
+		s.mustRangeScanOK(c, "A\x00", "C", 5, 10)
 	}
 	checkV10()
 
@@ -297,6 +336,9 @@ func (s *testMockTiKVSuite) TestScan(c *C) {
 		s.mustScanOK(c, "", 5, 20, "A", "A10", "B", "B20", "C", "C10", "D", "D20", "E", "E10")
 		s.mustScanOK(c, "C", 5, 20, "C", "C10", "D", "D20", "E", "E10")
 		s.mustScanOK(c, "D\x00", 1, 20, "E", "E10")
+		s.mustRangeScanOK(c, "B", "D", 5, 20, "B", "B20", "C", "C10")
+		s.mustRangeScanOK(c, "B", "D\x00", 5, 20, "B", "B20", "C", "C10", "D", "D20")
+		s.mustRangeScanOK(c, "B\x00", "D\x00", 5, 20, "C", "C10", "D", "D20")
 	}
 	checkV10()
 	checkV20()

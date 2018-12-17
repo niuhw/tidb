@@ -18,7 +18,7 @@ import (
 	"strings"
 
 	. "github.com/pingcap/check"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/util/testkit"
 )
 
@@ -219,7 +219,7 @@ func checkMergeAndRun(tk *testkit.TestKit, c *C, sql string) *testkit.Result {
 	result := tk.MustQuery(explainedSql)
 	resultStr := fmt.Sprintf("%v", result.Rows())
 	if !strings.ContainsAny(resultStr, "MergeJoin") {
-		c.Error("Expected MergeJoin in plan.")
+		c.Error("Expected MergeJoin in plannercore.")
 	}
 	return tk.MustQuery(sql)
 }
@@ -289,15 +289,27 @@ func (s *testSuite) TestMergeJoin(c *C) {
 	result.Check(testkit.Rows("1", "2", "3", "4", "5", "6", "7"))
 	result = tk.MustQuery("select /*+ TIDB_SMJ(a, b) */ a.c1 from t a , (select * from t1 limit 3) b where a.c1 = b.c1 order by b.c1;")
 	result.Check(testkit.Rows("1", "2", "3"))
+	// Test LogicalSelection under LogicalJoin.
+	result = tk.MustQuery("select /*+ TIDB_SMJ(a, b) */ a.c1 from t a , (select * from t1 limit 3) b where a.c1 = b.c1 and b.c1 is not null order by b.c1;")
+	result.Check(testkit.Rows("1", "2", "3"))
+	tk.MustExec("begin;")
+	// Test LogicalLock under LogicalJoin.
+	result = tk.MustQuery("select /*+ TIDB_SMJ(a, b) */ a.c1 from t a , (select * from t1 for update) b where a.c1 = b.c1 order by a.c1;")
+	result.Check(testkit.Rows("1", "2", "3", "4", "5", "6", "7"))
+	// Test LogicalUnionScan under LogicalJoin.
+	tk.MustExec("insert into t1 values(8);")
+	result = tk.MustQuery("select /*+ TIDB_SMJ(a, b) */ a.c1 from t a , t1 b where a.c1 = b.c1;")
+	result.Check(testkit.Rows("1", "2", "3", "4", "5", "6", "7"))
+	tk.MustExec("rollback;")
 
-	plan.AllowCartesianProduct = false
+	plannercore.AllowCartesianProduct = false
 	_, err := tk.Exec("select /*+ TIDB_SMJ(t,t1) */ * from t, t1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
 	_, err = tk.Exec("select /*+ TIDB_SMJ(t,t1) */ * from t left join t1 on 1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
 	_, err = tk.Exec("select /*+ TIDB_SMJ(t,t1) */ * from t right join t1 on 1")
-	c.Check(plan.ErrCartesianProductUnsupported.Equal(err), IsTrue)
-	plan.AllowCartesianProduct = true
+	c.Check(plannercore.ErrCartesianProductUnsupported.Equal(err), IsTrue)
+	plannercore.AllowCartesianProduct = true
 	tk.MustExec("drop table if exists t")
 	tk.MustExec("drop table if exists t1")
 	tk.MustExec("create table t(c1 int)")

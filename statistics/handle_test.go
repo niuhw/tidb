@@ -17,39 +17,19 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/model"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/store/mockstore"
+	"github.com/pingcap/tidb/store/tikv/oracle"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testkit"
-	"github.com/pingcap/tidb/util/testleak"
 )
-
-var _ = Suite(&testStatsCacheSuite{})
-
-type testStatsCacheSuite struct {
-	store kv.Storage
-	do    *domain.Domain
-}
-
-func (s *testStatsCacheSuite) SetUpSuite(c *C) {
-	testleak.BeforeTest()
-	var err error
-	s.store, s.do, err = newStoreWithBootstrap(0)
-	c.Assert(err, IsNil)
-}
-
-func (s *testStatsCacheSuite) TearDownSuite(c *C) {
-	s.do.Close()
-	s.store.Close()
-	testleak.AfterTest(c)()
-}
 
 func cleanEnv(c *C, store kv.Storage, do *domain.Domain) {
 	tk := testkit.NewTestKit(c, store)
@@ -59,13 +39,13 @@ func cleanEnv(c *C, store kv.Storage, do *domain.Domain) {
 		tableName := tb[0]
 		tk.MustExec(fmt.Sprintf("drop table %v", tableName))
 	}
+	tk.MustExec("delete from mysql.stats_meta")
+	tk.MustExec("delete from mysql.stats_histograms")
+	tk.MustExec("delete from mysql.stats_buckets")
 	do.StatsHandle().Clear()
-	tk.MustExec("truncate table mysql.stats_meta")
-	tk.MustExec("truncate table mysql.stats_histograms")
-	tk.MustExec("truncate table mysql.stats_buckets")
 }
 
-func (s *testStatsCacheSuite) TestStatsCache(c *C) {
+func (s *testStatsSuite) TestStatsCache(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -111,6 +91,8 @@ func (s *testStatsCacheSuite) TestStatsCache(c *C) {
 }
 
 func assertTableEqual(c *C, a *statistics.Table, b *statistics.Table) {
+	c.Assert(a.Count, Equals, b.Count)
+	c.Assert(a.ModifyCount, Equals, b.ModifyCount)
 	c.Assert(len(a.Columns), Equals, len(b.Columns))
 	for i := range a.Columns {
 		c.Assert(a.Columns[i].Count, Equals, b.Columns[i].Count)
@@ -132,7 +114,7 @@ func assertTableEqual(c *C, a *statistics.Table, b *statistics.Table) {
 	}
 }
 
-func (s *testStatsCacheSuite) TestStatsStoreAndLoad(c *C) {
+func (s *testStatsSuite) TestStatsStoreAndLoad(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -159,7 +141,7 @@ func (s *testStatsCacheSuite) TestStatsStoreAndLoad(c *C) {
 	assertTableEqual(c, statsTbl1, statsTbl2)
 }
 
-func (s *testStatsCacheSuite) TestEmptyTable(c *C) {
+func (s *testStatsSuite) TestEmptyTable(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -176,7 +158,7 @@ func (s *testStatsCacheSuite) TestEmptyTable(c *C) {
 	c.Assert(count, Equals, 0.0)
 }
 
-func (s *testStatsCacheSuite) TestColumnIDs(c *C) {
+func (s *testStatsSuite) TestColumnIDs(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -207,7 +189,7 @@ func (s *testStatsCacheSuite) TestColumnIDs(c *C) {
 	c.Assert(count, Equals, 0.0)
 }
 
-func (s *testStatsCacheSuite) TestAvgColLen(c *C) {
+func (s *testStatsSuite) TestAvgColLen(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -235,7 +217,15 @@ func (s *testStatsCacheSuite) TestAvgColLen(c *C) {
 	c.Assert(statsTbl.Columns[tableInfo.Columns[3].ID].AvgColSize(statsTbl.Count), Equals, 16.0)
 }
 
-func (s *testStatsCacheSuite) TestVersion(c *C) {
+func (s *testStatsSuite) TestDurationToTS(c *C) {
+	tests := []time.Duration{time.Millisecond, time.Second, time.Minute, time.Hour}
+	for _, t := range tests {
+		ts := statistics.DurationToTS(t)
+		c.Assert(oracle.ExtractPhysical(ts)*int64(time.Millisecond), Equals, int64(t))
+	}
+}
+
+func (s *testStatsSuite) TestVersion(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -246,12 +236,12 @@ func (s *testStatsCacheSuite) TestVersion(c *C) {
 	tbl1, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t1"))
 	c.Assert(err, IsNil)
 	tableInfo1 := tbl1.Meta()
-	h := statistics.NewHandle(testKit.Se, 0)
-	testKit.MustExec("update mysql.stats_meta set version = 2 where table_id = ?", tableInfo1.ID)
+	h := statistics.NewHandle(testKit.Se, time.Millisecond)
+	unit := oracle.ComposeTS(1, 0)
+	testKit.MustExec("update mysql.stats_meta set version = ? where table_id = ?", 2*unit, tableInfo1.ID)
 
 	h.Update(is)
-	c.Assert(h.LastVersion, Equals, uint64(2))
-	c.Assert(h.PrevLastVersion, Equals, uint64(0))
+	c.Assert(h.LastUpdateVersion(), Equals, 2*unit)
 	statsTbl1 := h.GetTableStats(tableInfo1)
 	c.Assert(statsTbl1.Pseudo, IsFalse)
 
@@ -262,39 +252,36 @@ func (s *testStatsCacheSuite) TestVersion(c *C) {
 	c.Assert(err, IsNil)
 	tableInfo2 := tbl2.Meta()
 	// A smaller version write, and we can still read it.
-	testKit.MustExec("update mysql.stats_meta set version = 1 where table_id = ?", tableInfo2.ID)
+	testKit.MustExec("update mysql.stats_meta set version = ? where table_id = ?", unit, tableInfo2.ID)
 	h.Update(is)
-	c.Assert(h.LastVersion, Equals, uint64(2))
-	c.Assert(h.PrevLastVersion, Equals, uint64(2))
+	c.Assert(h.LastUpdateVersion(), Equals, 2*unit)
 	statsTbl2 := h.GetTableStats(tableInfo2)
 	c.Assert(statsTbl2.Pseudo, IsFalse)
 
 	testKit.MustExec("insert t1 values(1,2)")
 	testKit.MustExec("analyze table t1")
-	testKit.MustExec("update mysql.stats_meta set version = 4 where table_id = ?", tableInfo1.ID)
+	offset := 3 * unit
+	testKit.MustExec("update mysql.stats_meta set version = ? where table_id = ?", offset+4, tableInfo1.ID)
 	h.Update(is)
-	c.Assert(h.LastVersion, Equals, uint64(4))
-	c.Assert(h.PrevLastVersion, Equals, uint64(2))
+	c.Assert(h.LastUpdateVersion(), Equals, offset+uint64(4))
 	statsTbl1 = h.GetTableStats(tableInfo1)
 	c.Assert(statsTbl1.Count, Equals, int64(1))
 
 	testKit.MustExec("insert t2 values(1,2)")
 	testKit.MustExec("analyze table t2")
 	// A smaller version write, and we can still read it.
-	testKit.MustExec("update mysql.stats_meta set version = 3 where table_id = ?", tableInfo2.ID)
+	testKit.MustExec("update mysql.stats_meta set version = ? where table_id = ?", offset+3, tableInfo2.ID)
 	h.Update(is)
-	c.Assert(h.LastVersion, Equals, uint64(4))
-	c.Assert(h.PrevLastVersion, Equals, uint64(4))
+	c.Assert(h.LastUpdateVersion(), Equals, offset+uint64(4))
 	statsTbl2 = h.GetTableStats(tableInfo2)
 	c.Assert(statsTbl2.Count, Equals, int64(1))
 
 	testKit.MustExec("insert t2 values(1,2)")
 	testKit.MustExec("analyze table t2")
-	// A smaller version write, and we cannot read it. Because at this time, lastTwo Version is 4.
-	testKit.MustExec("update mysql.stats_meta set version = 3 where table_id = ?", tableInfo2.ID)
+	// A smaller version write, and we cannot read it. Because at this time, lastThree Version is 4.
+	testKit.MustExec("update mysql.stats_meta set version = 1 where table_id = ?", tableInfo2.ID)
 	h.Update(is)
-	c.Assert(h.LastVersion, Equals, uint64(4))
-	c.Assert(h.PrevLastVersion, Equals, uint64(4))
+	c.Assert(h.LastUpdateVersion(), Equals, offset+uint64(4))
 	statsTbl2 = h.GetTableStats(tableInfo2)
 	c.Assert(statsTbl2.Count, Equals, int64(1))
 
@@ -315,7 +302,7 @@ func (s *testStatsCacheSuite) TestVersion(c *C) {
 	c.Assert(statsTbl2.Columns[int64(3)], NotNil)
 }
 
-func (s *testStatsCacheSuite) TestLoadHist(c *C) {
+func (s *testStatsSuite) TestLoadHist(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -337,7 +324,7 @@ func (s *testStatsCacheSuite) TestLoadHist(c *C) {
 	for i := 0; i < rowCount; i++ {
 		testKit.MustExec("insert into t values('bb','sdfga')")
 	}
-	h.DumpStatsDeltaToKV()
+	h.DumpStatsDeltaToKV(statistics.DumpAll)
 	h.Update(do.InfoSchema())
 	newStatsTbl := h.GetTableStats(tableInfo)
 	// The stats table is updated.
@@ -373,7 +360,7 @@ func (s *testStatsCacheSuite) TestLoadHist(c *C) {
 	c.Assert(newStatsTbl2.Columns[int64(3)].LastUpdateVersion, Greater, newStatsTbl2.Columns[int64(1)].LastUpdateVersion)
 }
 
-func (s *testStatsCacheSuite) TestInitStats(c *C) {
+func (s *testStatsSuite) TestInitStats(c *C) {
 	defer cleanEnv(c, s.store, s.do)
 	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
@@ -398,23 +385,25 @@ func (s *testStatsCacheSuite) TestInitStats(c *C) {
 	h.Lease = 0
 }
 
-func (s *testStatsUpdateSuite) TestLoadStats(c *C) {
-	store, do, err := newStoreWithBootstrap(10 * time.Millisecond)
-	c.Assert(err, IsNil)
-	defer store.Close()
-	defer do.Close()
-	testKit := testkit.NewTestKit(c, store)
+func (s *testStatsSuite) TestLoadStats(c *C) {
+	defer cleanEnv(c, s.store, s.do)
+	testKit := testkit.NewTestKit(c, s.store)
 	testKit.MustExec("use test")
 	testKit.MustExec("create table t(a int, b int, c int, primary key(a), key idx(b))")
 	testKit.MustExec("insert into t values (1,1,1),(2,2,2),(3,3,3)")
+
+	oriLease := s.do.StatsHandle().Lease
+	s.do.StatsHandle().Lease = 1
+	defer func() {
+		s.do.StatsHandle().Lease = oriLease
+	}()
 	testKit.MustExec("analyze table t")
 
-	is := do.InfoSchema()
+	is := s.do.InfoSchema()
 	tbl, err := is.TableByName(model.NewCIStr("test"), model.NewCIStr("t"))
 	c.Assert(err, IsNil)
 	tableInfo := tbl.Meta()
-	h := do.StatsHandle()
-	time.Sleep(1 * time.Second)
+	h := s.do.StatsHandle()
 	stat := h.GetTableStats(tableInfo)
 	hg := stat.Columns[tableInfo.Columns[0].ID].Histogram
 	c.Assert(hg.Len(), Greater, 0)
@@ -430,7 +419,7 @@ func (s *testStatsUpdateSuite) TestLoadStats(c *C) {
 	c.Assert(cms, IsNil)
 	_, err = stat.ColumnEqualRowCount(testKit.Se.GetSessionVars().StmtCtx, types.NewIntDatum(1), tableInfo.Columns[2].ID)
 	c.Assert(err, IsNil)
-	time.Sleep(1 * time.Second)
+	c.Assert(h.LoadNeededHistograms(), IsNil)
 	stat = h.GetTableStats(tableInfo)
 	hg = stat.Columns[tableInfo.Columns[2].ID].Histogram
 	c.Assert(hg.Len(), Greater, 0)
@@ -445,5 +434,6 @@ func newStoreWithBootstrap(statsLease time.Duration) (kv.Storage, *domain.Domain
 	session.SetStatsLease(statsLease)
 	domain.RunAutoAnalyze = false
 	do, err := session.BootstrapSession(store)
+	do.SetStatsUpdating(true)
 	return store, do, errors.Trace(err)
 }

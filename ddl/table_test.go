@@ -14,20 +14,20 @@
 package ddl
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/juju/errors"
 	. "github.com/pingcap/check"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/meta/autoid"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/testleak"
-	"golang.org/x/net/context"
 )
 
 var _ = Suite(&testTableSuite{})
@@ -198,7 +198,7 @@ func (s *testTableSuite) TearDownSuite(c *C) {
 	testDropSchema(c, testNewContext(s.d), s.d, s.dbInfo)
 	s.d.Stop()
 	s.store.Close()
-	testleak.AfterTest(c)()
+	testleak.AfterTest(c, TestLeakCheckCnt)()
 }
 
 func (s *testTableSuite) TestTable(c *C) {

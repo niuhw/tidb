@@ -16,15 +16,15 @@
 package tikv
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"sync"
 	"time"
 
 	. "github.com/pingcap/check"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/terror"
-	"golang.org/x/net/context"
 )
 
 // The test suite takes too long under the race detector.

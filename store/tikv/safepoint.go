@@ -14,15 +14,15 @@
 package tikv
 
 import (
+	"context"
 	"crypto/tls"
 	"strconv"
 	"sync"
 	"time"
 
 	"github.com/coreos/etcd/clientv3"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 // Safe point constants.

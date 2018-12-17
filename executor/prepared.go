@@ -14,24 +14,22 @@
 package executor
 
 import (
+	"context"
 	"math"
 	"sort"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/kv"
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/plan"
+	"github.com/pingcap/tidb/planner"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/sessionctx"
-	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/types"
+	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/types/parser_driver"
 	"github.com/pingcap/tidb/util/chunk"
-	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/sqlexec"
-	"golang.org/x/net/context"
 )
 
 var (
@@ -41,7 +39,7 @@ var (
 )
 
 type paramMarkerSorter struct {
-	markers []*ast.ParamMarkerExpr
+	markers []ast.ParamMarkerExpr
 }
 
 func (p *paramMarkerSorter) Len() int {
@@ -49,7 +47,7 @@ func (p *paramMarkerSorter) Len() int {
 }
 
 func (p *paramMarkerSorter) Less(i, j int) bool {
-	return p.markers[i].Offset < p.markers[j].Offset
+	return p.markers[i].(*driver.ParamMarkerExpr).Offset < p.markers[j].(*driver.ParamMarkerExpr).Offset
 }
 
 func (p *paramMarkerSorter) Swap(i, j int) {
@@ -57,7 +55,7 @@ func (p *paramMarkerSorter) Swap(i, j int) {
 }
 
 type paramMarkerExtractor struct {
-	markers []*ast.ParamMarkerExpr
+	markers []ast.ParamMarkerExpr
 }
 
 func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
@@ -65,7 +63,7 @@ func (e *paramMarkerExtractor) Enter(in ast.Node) (ast.Node, bool) {
 }
 
 func (e *paramMarkerExtractor) Leave(in ast.Node) (ast.Node, bool) {
-	if x, ok := in.(*ast.ParamMarkerExpr); ok {
+	if x, ok := in.(*driver.ParamMarkerExpr); ok {
 		e.markers = append(e.markers, x)
 	}
 	return in, true
@@ -86,8 +84,10 @@ type PrepareExec struct {
 
 // NewPrepareExec creates a new PrepareExec.
 func NewPrepareExec(ctx sessionctx.Context, is infoschema.InfoSchema, sqlTxt string) *PrepareExec {
+	base := newBaseExecutor(ctx, nil, "PrepareStmt")
+	base.initCap = chunk.ZeroCapacity
 	return &PrepareExec{
-		baseExecutor: newBaseExecutor(ctx, nil, "PrepareStmt"),
+		baseExecutor: base,
 		is:           is,
 		sqlText:      sqlTxt,
 	}
@@ -112,7 +112,9 @@ func (e *PrepareExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	if sqlParser, ok := e.ctx.(sqlexec.SQLParser); ok {
 		stmts, err = sqlParser.ParseSQL(e.sqlText, charset, collation)
 	} else {
-		stmts, err = parser.New().Parse(e.sqlText, charset, collation)
+		p := parser.New()
+		p.EnableWindowFunc(vars.EnableWindowFunction)
+		stmts, err = p.Parse(e.sqlText, charset, collation)
 	}
 	if err != nil {
 		return errors.Trace(err)
@@ -124,9 +126,20 @@ func (e *PrepareExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	if _, ok := stmt.(ast.DDLNode); ok {
 		return ErrPrepareDDL
 	}
+	err = ResetContextOfStmt(e.ctx, stmt)
+	if err != nil {
+		return err
+	}
 	var extractor paramMarkerExtractor
 	stmt.Accept(&extractor)
-	err = plan.Preprocess(e.ctx, stmt, e.is, true)
+
+	// Prepare parameters should NOT over 2 bytes(MaxUint16)
+	// https://dev.mysql.com/doc/internals/en/com-stmt-prepare-response.html#packet-COM_STMT_PREPARE_OK.
+	if len(extractor.markers) > math.MaxUint16 {
+		return ErrPsManyParam
+	}
+
+	err = plannercore.Preprocess(e.ctx, stmt, e.is, true)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -138,21 +151,21 @@ func (e *PrepareExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	sort.Sort(sorter)
 	e.ParamCount = len(sorter.markers)
 	for i := 0; i < e.ParamCount; i++ {
-		sorter.markers[i].Order = i
+		sorter.markers[i].SetOrder(i)
 	}
-	prepared := &plan.Prepared{
+	prepared := &ast.Prepared{
 		Stmt:          stmt,
 		Params:        sorter.markers,
 		SchemaVersion: e.is.SchemaMetaVersion(),
 	}
-	prepared.UseCache = plan.PreparedPlanCacheEnabled && (vars.ImportingData || plan.Cacheable(stmt))
+	prepared.UseCache = plannercore.PreparedPlanCacheEnabled() && (vars.LightningMode || plannercore.Cacheable(stmt))
 
 	// We try to build the real statement of preparedStmt.
 	for i := range prepared.Params {
-		prepared.Params[i].SetDatum(types.NewIntDatum(0))
+		prepared.Params[i].(*driver.ParamMarkerExpr).Datum.SetNull()
 	}
-	var p plan.Plan
-	p, err = plan.BuildLogicalPlan(e.ctx, stmt, e.is)
+	var p plannercore.Plan
+	p, err = plannercore.BuildLogicalPlan(e.ctx, stmt, e.is)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -165,8 +178,7 @@ func (e *PrepareExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	if e.name != "" {
 		vars.PreparedStmtNameToID[e.name] = e.ID
 	}
-	vars.PreparedStmts[e.ID] = prepared
-	return nil
+	return vars.AddPreparedStmt(e.ID, prepared)
 }
 
 // ExecuteExec represents an EXECUTE executor.
@@ -181,7 +193,7 @@ type ExecuteExec struct {
 	id        uint32
 	stmtExec  Executor
 	stmt      ast.StmtNode
-	plan      plan.Plan
+	plan      plannercore.Plan
 }
 
 // Next implements the Executor Next interface.
@@ -195,19 +207,16 @@ func (e *ExecuteExec) Build() error {
 	var err error
 	if IsPointGetWithPKOrUniqueKeyByAutoCommit(e.ctx, e.plan) {
 		err = e.ctx.InitTxnWithStartTS(math.MaxUint64)
-	} else {
-		err = e.ctx.ActivePendingTxn()
 	}
 	if err != nil {
 		return errors.Trace(err)
 	}
-	b := newExecutorBuilder(e.ctx, e.is, kv.PriorityNormal)
+	b := newExecutorBuilder(e.ctx, e.is)
 	stmtExec := b.build(e.plan)
 	if b.err != nil {
 		return errors.Trace(b.err)
 	}
 	e.stmtExec = stmtExec
-	ResetStmtCtx(e.ctx, e.stmt)
 	CountStmtNode(e.stmt, e.ctx.GetSessionVars().InRestrictedSQL)
 	logExpensiveQuery(e.stmt, e.plan)
 	return nil
@@ -225,22 +234,30 @@ func (e *DeallocateExec) Next(ctx context.Context, chk *chunk.Chunk) error {
 	vars := e.ctx.GetSessionVars()
 	id, ok := vars.PreparedStmtNameToID[e.Name]
 	if !ok {
-		return errors.Trace(plan.ErrStmtNotFound)
+		return errors.Trace(plannercore.ErrStmtNotFound)
 	}
 	delete(vars.PreparedStmtNameToID, e.Name)
-	delete(vars.PreparedStmts, id)
+	if plannercore.PreparedPlanCacheEnabled() {
+		e.ctx.PreparedPlanCache().Delete(plannercore.NewPSTMTPlanCacheKey(
+			vars, id, vars.PreparedStmts[id].SchemaVersion,
+		))
+	}
+	vars.RemovePreparedStmt(id)
 	return nil
 }
 
 // CompileExecutePreparedStmt compiles a session Execute command to a stmt.Statement.
-func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...interface{}) (ast.Statement, error) {
+func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...interface{}) (sqlexec.Statement, error) {
 	execStmt := &ast.ExecuteStmt{ExecID: ID}
+	if err := ResetContextOfStmt(ctx, execStmt); err != nil {
+		return nil, err
+	}
 	execStmt.UsingVars = make([]ast.ExprNode, len(args))
 	for i, val := range args {
 		execStmt.UsingVars[i] = ast.NewValueExpr(val)
 	}
 	is := GetInfoSchema(ctx)
-	execPlan, err := plan.Optimize(ctx, execStmt, is)
+	execPlan, err := planner.Optimize(ctx, execStmt, is)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -251,92 +268,22 @@ func CompileExecutePreparedStmt(ctx sessionctx.Context, ID uint32, args ...inter
 		StmtNode:   execStmt,
 		Ctx:        ctx,
 	}
-	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID].(*plan.Prepared); ok {
+	if prepared, ok := ctx.GetSessionVars().PreparedStmts[ID]; ok {
 		stmt.Text = prepared.Stmt.Text()
 	}
 	return stmt, nil
 }
 
-// ResetStmtCtx resets the StmtContext.
-// Before every execution, we must clear statement context.
-func ResetStmtCtx(ctx sessionctx.Context, s ast.StmtNode) {
-	sessVars := ctx.GetSessionVars()
-	sc := new(stmtctx.StatementContext)
-	sc.TimeZone = sessVars.GetTimeZone()
-	sc.MemTracker = memory.NewTracker(s.Text(), sessVars.MemQuotaQuery)
-	switch config.GetGlobalConfig().OOMAction {
-	case config.OOMActionCancel:
-		sc.MemTracker.SetActionOnExceed(&memory.PanicOnExceed{})
-	case config.OOMActionLog:
-		sc.MemTracker.SetActionOnExceed(&memory.LogOnExceed{})
-	default:
-		sc.MemTracker.SetActionOnExceed(&memory.LogOnExceed{})
-	}
-
-	switch stmt := s.(type) {
-	case *ast.UpdateStmt:
-		sc.IgnoreTruncate = false
-		sc.OverflowAsWarning = false
-		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
-		sc.InUpdateOrDeleteStmt = true
-		sc.DividedByZeroAsWarning = stmt.IgnoreErr
-		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
-	case *ast.DeleteStmt:
-		sc.IgnoreTruncate = false
-		sc.OverflowAsWarning = false
-		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
-		sc.InUpdateOrDeleteStmt = true
-		sc.DividedByZeroAsWarning = stmt.IgnoreErr
-		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
-	case *ast.InsertStmt:
-		sc.IgnoreTruncate = false
-		sc.TruncateAsWarning = !sessVars.StrictSQLMode || stmt.IgnoreErr
-		sc.InInsertStmt = true
-		sc.DividedByZeroAsWarning = stmt.IgnoreErr
-		sc.IgnoreZeroInDate = !sessVars.StrictSQLMode || stmt.IgnoreErr
-	case *ast.CreateTableStmt, *ast.AlterTableStmt:
-		// Make sure the sql_mode is strict when checking column default value.
-		sc.IgnoreTruncate = false
-		sc.OverflowAsWarning = false
-		sc.TruncateAsWarning = false
-	case *ast.LoadDataStmt:
-		sc.IgnoreTruncate = false
-		sc.OverflowAsWarning = false
-		sc.TruncateAsWarning = !sessVars.StrictSQLMode
-	case *ast.SelectStmt:
-		sc.InSelectStmt = true
-
-		// see https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sql-mode-strict
-		// said "For statements such as SELECT that do not change data, invalid values
-		// generate a warning in strict mode, not an error."
-		// and https://dev.mysql.com/doc/refman/5.7/en/out-of-range-and-overflow.html
-		sc.OverflowAsWarning = true
-
-		// Return warning for truncate error in selection.
-		sc.IgnoreTruncate = false
-		sc.TruncateAsWarning = true
-		sc.IgnoreZeroInDate = true
-		if opts := stmt.SelectStmtOpts; opts != nil {
-			sc.Priority = opts.Priority
-			sc.NotFillCache = !opts.SQLCache
+func getPreparedStmt(stmt *ast.ExecuteStmt, vars *variable.SessionVars) (ast.StmtNode, error) {
+	execID := stmt.ExecID
+	ok := false
+	if stmt.Name != "" {
+		if execID, ok = vars.PreparedStmtNameToID[stmt.Name]; !ok {
+			return nil, plannercore.ErrStmtNotFound
 		}
-		sc.PadCharToFullLength = ctx.GetSessionVars().SQLMode.HasPadCharToFullLengthMode()
-	default:
-		sc.IgnoreTruncate = true
-		sc.OverflowAsWarning = false
-		if show, ok := s.(*ast.ShowStmt); ok {
-			if show.Tp == ast.ShowWarnings {
-				sc.InShowWarning = true
-				sc.SetWarnings(sessVars.StmtCtx.GetWarnings())
-			}
-		}
-		sc.IgnoreZeroInDate = true
 	}
-	if sessVars.LastInsertID > 0 {
-		sessVars.PrevLastInsertID = sessVars.LastInsertID
-		sessVars.LastInsertID = 0
+	if prepared, ok := vars.PreparedStmts[execID]; ok {
+		return prepared.Stmt, nil
 	}
-	sessVars.ResetPrevAffectedRows()
-	sessVars.InsertID = 0
-	sessVars.StmtCtx = sc
+	return nil, plannercore.ErrStmtNotFound
 }

@@ -15,6 +15,7 @@ package mocktikv
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"sync"
 
@@ -22,7 +23,6 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/tablecodec"
-	"golang.org/x/net/context"
 )
 
 // Cluster simulates a TiKV cluster. It focuses on management and the change of
@@ -230,14 +230,14 @@ func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer) 
 
 // Bootstrap creates the first Region. The Stores should be in the Cluster before
 // bootstrap.
-func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderStoreID uint64) {
+func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
 	if len(storeIDs) != len(peerIDs) {
 		panic("len(storeIDs) != len(peerIDs)")
 	}
-	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderStoreID)
+	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID)
 }
 
 // AddPeer adds a new Peer for the Region on the Store.
@@ -259,11 +259,11 @@ func (c *Cluster) RemovePeer(regionID, storeID uint64) {
 
 // ChangeLeader sets the Region's leader Peer. Caller should guarantee the Peer
 // exists.
-func (c *Cluster) ChangeLeader(regionID, leaderStoreID uint64) {
+func (c *Cluster) ChangeLeader(regionID, leaderPeerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.regions[regionID].changeLeader(leaderStoreID)
+	c.regions[regionID].changeLeader(leaderPeerID)
 }
 
 // GiveUpLeader sets the Region's leader to 0. The Region will have no leader
@@ -464,8 +464,8 @@ func (r *Region) removePeer(peerID uint64) {
 	r.incConfVer()
 }
 
-func (r *Region) changeLeader(leaderStoreID uint64) {
-	r.leader = leaderStoreID
+func (r *Region) changeLeader(leaderID uint64) {
+	r.leader = leaderID
 }
 
 func (r *Region) leaderPeer() *metapb.Peer {

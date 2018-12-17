@@ -14,24 +14,25 @@
 package executor
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
-	"github.com/pingcap/tidb/ddl/util"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/sqlexec"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
 )
 
 // SimpleExec represents simple statement executor.
@@ -58,7 +59,7 @@ func (e *SimpleExec) Next(ctx context.Context, chk *chunk.Chunk) (err error) {
 	case *ast.FlushStmt:
 		err = e.executeFlush(x)
 	case *ast.BeginStmt:
-		err = e.executeBegin(x)
+		err = e.executeBegin(ctx, x)
 	case *ast.CommitStmt:
 		e.executeCommit(x)
 	case *ast.RollbackStmt:
@@ -83,11 +84,28 @@ func (e *SimpleExec) Next(ctx context.Context, chk *chunk.Chunk) (err error) {
 	return errors.Trace(err)
 }
 
+func (e *SimpleExec) dbAccessDenied(dbname string) error {
+	user := e.ctx.GetSessionVars().User
+	u := user.Username
+	h := user.Hostname
+	if len(user.AuthUsername) > 0 && len(user.AuthHostname) > 0 {
+		u = user.AuthUsername
+		h = user.AuthHostname
+	}
+	return ErrDBaccessDenied.GenWithStackByArgs(u, h, dbname)
+}
+
 func (e *SimpleExec) executeUse(s *ast.UseStmt) error {
 	dbname := model.NewCIStr(s.DBName)
+
+	checker := privilege.GetPrivilegeManager(e.ctx)
+	if checker != nil && e.ctx.GetSessionVars().User != nil && !checker.DBIsVisible(fmt.Sprint(dbname)) {
+		return e.dbAccessDenied(dbname.O)
+	}
+
 	dbinfo, exists := e.is.SchemaByName(dbname)
 	if !exists {
-		return infoschema.ErrDatabaseNotExists.GenByArgs(dbname)
+		return infoschema.ErrDatabaseNotExists.GenWithStackByArgs(dbname)
 	}
 	e.ctx.GetSessionVars().CurrentDB = dbname.O
 	// character_set_database is the character set used by the default database.
@@ -99,12 +117,12 @@ func (e *SimpleExec) executeUse(s *ast.UseStmt) error {
 	return nil
 }
 
-func (e *SimpleExec) executeBegin(s *ast.BeginStmt) error {
+func (e *SimpleExec) executeBegin(ctx context.Context, s *ast.BeginStmt) error {
 	// If BEGIN is the first statement in TxnCtx, we can reuse the existing transaction, without the
 	// need to call NewTxn, which commits the existing transaction and begins a new one.
 	txnCtx := e.ctx.GetSessionVars().TxnCtx
-	if txnCtx.Histroy != nil {
-		err := e.ctx.NewTxn()
+	if txnCtx.History != nil {
+		err := e.ctx.NewTxn(ctx)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -113,6 +131,8 @@ func (e *SimpleExec) executeBegin(s *ast.BeginStmt) error {
 	// the transaction with COMMIT or ROLLBACK. The autocommit mode then
 	// reverts to its previous state.
 	e.ctx.GetSessionVars().SetStatusFlag(mysql.ServerStatusInTrans, true)
+	// Call ctx.Txn(true) to active pending txn.
+	e.ctx.Txn(true)
 	return nil
 }
 
@@ -122,11 +142,11 @@ func (e *SimpleExec) executeCommit(s *ast.CommitStmt) {
 
 func (e *SimpleExec) executeRollback(s *ast.RollbackStmt) error {
 	sessVars := e.ctx.GetSessionVars()
-	log.Infof("[%d] execute rollback statement", sessVars.ConnectionID)
+	log.Debugf("con:%d execute rollback statement", sessVars.ConnectionID)
 	sessVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
-	if e.ctx.Txn().Valid() {
+	if e.ctx.Txn(true).Valid() {
 		e.ctx.GetSessionVars().TxnCtx.ClearDelta()
-		return e.ctx.Txn().Rollback()
+		return e.ctx.Txn(true).Rollback()
 	}
 	return nil
 }
@@ -148,7 +168,7 @@ func (e *SimpleExec) executeCreateUser(s *ast.CreateUserStmt) error {
 		if !ok {
 			return errors.Trace(ErrPasswordFormat)
 		}
-		user := fmt.Sprintf(`("%s", "%s", "%s")`, spec.User.Hostname, spec.User.Username, pwd)
+		user := fmt.Sprintf(`('%s', '%s', '%s')`, spec.User.Hostname, spec.User.Username, pwd)
 		users = append(users, user)
 	}
 	if len(users) == 0 {
@@ -197,7 +217,7 @@ func (e *SimpleExec) executeAlterUser(s *ast.AlterUserStmt) error {
 				pwd = auth.EncodePassword(spec.AuthOpt.HashString)
 			}
 		}
-		sql := fmt.Sprintf(`UPDATE %s.%s SET Password = "%s" WHERE Host = "%s" and User = "%s";`,
+		sql := fmt.Sprintf(`UPDATE %s.%s SET Password = '%s' WHERE Host = '%s' and User = '%s';`,
 			mysql.SystemDB, mysql.UserTable, pwd, spec.User.Hostname, spec.User.Username)
 		_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 		if err != nil {
@@ -206,12 +226,11 @@ func (e *SimpleExec) executeAlterUser(s *ast.AlterUserStmt) error {
 	}
 	if len(failedUsers) > 0 {
 		// Commit the transaction even if we returns error
-		err := e.ctx.Txn().Commit(sessionctx.SetConnID2Ctx(context.Background(), e.ctx))
+		err := e.ctx.Txn(true).Commit(sessionctx.SetCommitCtx(context.Background(), e.ctx))
 		if err != nil {
 			return errors.Trace(err)
 		}
-		errMsg := "Operation ALTER USER failed for " + strings.Join(failedUsers, ",")
-		return terror.ClassExecutor.New(CodeCannotUser, errMsg)
+		return ErrCannotUser.GenWithStackByArgs("ALTER USER", strings.Join(failedUsers, ","))
 	}
 	domain.GetDomain(e.ctx).NotifyUpdatePrivilege(e.ctx)
 	return nil
@@ -230,27 +249,54 @@ func (e *SimpleExec) executeDropUser(s *ast.DropUserStmt) error {
 			}
 			continue
 		}
-		sql := fmt.Sprintf(`DELETE FROM %s.%s WHERE Host = "%s" and User = "%s";`, mysql.SystemDB, mysql.UserTable, user.Hostname, user.Username)
-		_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
-		if err != nil {
+
+		// begin a transaction to delete a user.
+		if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), "begin"); err != nil {
+			return errors.Trace(err)
+		}
+		sql := fmt.Sprintf(`DELETE FROM %s.%s WHERE Host = '%s' and User = '%s';`, mysql.SystemDB, mysql.UserTable, user.Hostname, user.Username)
+		if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), sql); err != nil {
+			failedUsers = append(failedUsers, user.String())
+			if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), "rollback"); err != nil {
+				return errors.Trace(err)
+			}
+			continue
+		}
+
+		// delete privileges from mysql.db
+		sql = fmt.Sprintf(`DELETE FROM %s.%s WHERE Host = '%s' and User = '%s';`, mysql.SystemDB, mysql.DBTable, user.Hostname, user.Username)
+		if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), sql); err != nil {
+			failedUsers = append(failedUsers, user.String())
+			if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), "rollback"); err != nil {
+				return errors.Trace(err)
+			}
+			continue
+		}
+
+		// delete privileges from mysql.tables_priv
+		sql = fmt.Sprintf(`DELETE FROM %s.%s WHERE Host = '%s' and User = '%s';`, mysql.SystemDB, mysql.TablePrivTable, user.Hostname, user.Username)
+		if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), sql); err != nil {
+			failedUsers = append(failedUsers, user.String())
+			if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), "rollback"); err != nil {
+				return errors.Trace(err)
+			}
+			continue
+		}
+
+		//TODO: need delete columns_priv once we implement columns_priv functionality.
+		if _, err := e.ctx.(sqlexec.SQLExecutor).Execute(context.Background(), "commit"); err != nil {
 			failedUsers = append(failedUsers, user.String())
 		}
 	}
 	if len(failedUsers) > 0 {
-		// Commit the transaction even if we returns error
-		err := e.ctx.Txn().Commit(sessionctx.SetConnID2Ctx(context.Background(), e.ctx))
-		if err != nil {
-			return errors.Trace(err)
-		}
-		errMsg := "Operation DROP USER failed for " + strings.Join(failedUsers, ",")
-		return terror.ClassExecutor.New(CodeCannotUser, errMsg)
+		return ErrCannotUser.GenWithStackByArgs("DROP USER", strings.Join(failedUsers, ","))
 	}
 	domain.GetDomain(e.ctx).NotifyUpdatePrivilege(e.ctx)
 	return nil
 }
 
 func userExists(ctx sessionctx.Context, name string, host string) (bool, error) {
-	sql := fmt.Sprintf(`SELECT * FROM %s.%s WHERE User="%s" AND Host="%s";`, mysql.SystemDB, mysql.UserTable, name, host)
+	sql := fmt.Sprintf(`SELECT * FROM %s.%s WHERE User='%s' AND Host='%s';`, mysql.SystemDB, mysql.UserTable, name, host)
 	rows, _, err := ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(ctx, sql)
 	if err != nil {
 		return false, errors.Trace(err)
@@ -259,14 +305,22 @@ func userExists(ctx sessionctx.Context, name string, host string) (bool, error) 
 }
 
 func (e *SimpleExec) executeSetPwd(s *ast.SetPwdStmt) error {
+	var u, h string
 	if s.User == nil {
-		vars := e.ctx.GetSessionVars()
-		s.User = vars.User
-		if s.User == nil {
+		if e.ctx.GetSessionVars().User == nil {
 			return errors.New("Session error is empty")
 		}
+		u = e.ctx.GetSessionVars().User.AuthUsername
+		h = e.ctx.GetSessionVars().User.AuthHostname
+	} else {
+		checker := privilege.GetPrivilegeManager(e.ctx)
+		if checker != nil && !checker.RequestVerification("", "", "", mysql.SuperPriv) {
+			return ErrDBaccessDenied.GenWithStackByArgs(u, h, "mysql")
+		}
+		u = s.User.Username
+		h = s.User.Hostname
 	}
-	exists, err := userExists(e.ctx, s.User.Username, s.User.Hostname)
+	exists, err := userExists(e.ctx, u, h)
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -275,14 +329,15 @@ func (e *SimpleExec) executeSetPwd(s *ast.SetPwdStmt) error {
 	}
 
 	// update mysql.user
-	sql := fmt.Sprintf(`UPDATE %s.%s SET password="%s" WHERE User="%s" AND Host="%s";`, mysql.SystemDB, mysql.UserTable, auth.EncodePassword(s.Password), s.User.Username, s.User.Hostname)
+	sql := fmt.Sprintf(`UPDATE %s.%s SET password='%s' WHERE User='%s' AND Host='%s';`, mysql.SystemDB, mysql.UserTable, auth.EncodePassword(s.Password), u, h)
 	_, _, err = e.ctx.(sqlexec.RestrictedSQLExecutor).ExecRestrictedSQL(e.ctx, sql)
 	domain.GetDomain(e.ctx).NotifyUpdatePrivilege(e.ctx)
 	return errors.Trace(err)
 }
 
 func (e *SimpleExec) executeKillStmt(s *ast.KillStmt) error {
-	if s.TiDBExtension {
+	conf := config.GetGlobalConfig()
+	if s.TiDBExtension || conf.CompatibleKillQuery {
 		sm := e.ctx.GetSessionManager()
 		if sm == nil {
 			return nil
@@ -298,7 +353,9 @@ func (e *SimpleExec) executeKillStmt(s *ast.KillStmt) error {
 func (e *SimpleExec) executeFlush(s *ast.FlushStmt) error {
 	switch s.Tp {
 	case ast.FlushTables:
-		// TODO: A dummy implement
+		if s.ReadLock {
+			return errors.New("FLUSH TABLES WITH READ LOCK is not supported.  Please use @@tidb_snapshot")
+		}
 	case ast.FlushPrivileges:
 		dom := domain.GetDomain(e.ctx)
 		sysSessionPool := dom.SysSessionPool()
@@ -315,13 +372,9 @@ func (e *SimpleExec) executeFlush(s *ast.FlushStmt) error {
 
 func (e *SimpleExec) executeDropStats(s *ast.DropStatsStmt) error {
 	h := domain.GetDomain(e.ctx).StatsHandle()
-	if h.Lease <= 0 {
-		err := h.DeleteTableStatsFromKV(s.Table.TableInfo.ID)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		return errors.Trace(h.Update(GetInfoSchema(e.ctx)))
+	err := h.DeleteTableStatsFromKV(s.Table.TableInfo.ID)
+	if err != nil {
+		return errors.Trace(err)
 	}
-	h.DDLEventCh() <- &util.Event{Tp: model.ActionDropTable, TableInfo: s.Table.TableInfo}
-	return nil
+	return errors.Trace(h.Update(GetInfoSchema(e.ctx)))
 }

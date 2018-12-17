@@ -16,66 +16,68 @@ package main
 import (
 	"flag"
 	"fmt"
-	"net"
 	"os"
-	"os/signal"
 	"runtime"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
-	"github.com/juju/errors"
 	"github.com/opentracing/opentracing-go"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/pd/client"
+	pumpcli "github.com/pingcap/tidb-tools/tidb-binlog/pump_client"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/server"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/variable"
 	"github.com/pingcap/tidb/statistics"
+	kvstore "github.com/pingcap/tidb/store"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/store/tikv/gcworker"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/kvcache"
 	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/memory"
 	"github.com/pingcap/tidb/util/printer"
+	"github.com/pingcap/tidb/util/signal"
 	"github.com/pingcap/tidb/util/systimemon"
 	"github.com/pingcap/tidb/x-server"
-	binlog "github.com/pingcap/tipb/go-binlog"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/push"
 	log "github.com/sirupsen/logrus"
-	"google.golang.org/grpc"
+	"github.com/struCoder/pidusage"
 )
 
 // Flag Names
 const (
-	nmVersion         = "V"
-	nmConfig          = "config"
-	nmStore           = "store"
-	nmStorePath       = "path"
-	nmHost            = "host"
-	nmPort            = "P"
-	nmSocket          = "socket"
-	nmBinlogSocket    = "binlog-socket"
-	nmRunDDL          = "run-ddl"
-	nmLogLevel        = "L"
-	nmLogFile         = "log-file"
-	nmLogSlowQuery    = "log-slow-query"
-	nmReportStatus    = "report-status"
-	nmStatusPort      = "status"
-	nmMetricsAddr     = "metrics-addr"
-	nmMetricsInterval = "metrics-interval"
-	nmDdlLease        = "lease"
-	nmTokenLimit      = "token-limit"
+	nmVersion          = "V"
+	nmConfig           = "config"
+	nmStore            = "store"
+	nmStorePath        = "path"
+	nmHost             = "host"
+	nmAdvertiseAddress = "advertise-address"
+	nmPort             = "P"
+	nmCors             = "cors"
+	nmSocket           = "socket"
+	nmEnableBinlog     = "enable-binlog"
+	nmRunDDL           = "run-ddl"
+	nmLogLevel         = "L"
+	nmLogFile          = "log-file"
+	nmLogSlowQuery     = "log-slow-query"
+	nmReportStatus     = "report-status"
+	nmStatusPort       = "status"
+	nmMetricsAddr      = "metrics-addr"
+	nmMetricsInterval  = "metrics-interval"
+	nmDdlLease         = "lease"
+	nmTokenLimit       = "token-limit"
 
 	nmProxyProtocolNetworks      = "proxy-protocol-networks"
 	nmProxyProtocolHeaderTimeout = "proxy-protocol-header-timeout"
@@ -86,15 +88,17 @@ var (
 	configPath = flag.String(nmConfig, "", "config file path")
 
 	// Base
-	store        = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
-	storePath    = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
-	host         = flag.String(nmHost, "0.0.0.0", "tidb server host")
-	port         = flag.String(nmPort, "4000", "tidb server port")
-	socket       = flag.String(nmSocket, "", "The socket file to use for connection.")
-	binlogSocket = flag.String(nmBinlogSocket, "", "socket file to write binlog")
-	runDDL       = flagBoolean(nmRunDDL, true, "run ddl worker on this tidb-server")
-	ddlLease     = flag.String(nmDdlLease, "45s", "schema lease duration, very dangerous to change only if you know what you do")
-	tokenLimit   = flag.Int(nmTokenLimit, 1000, "the limit of concurrent executed sessions")
+	store            = flag.String(nmStore, "mocktikv", "registered store name, [tikv, mocktikv]")
+	storePath        = flag.String(nmStorePath, "/tmp/tidb", "tidb storage path")
+	host             = flag.String(nmHost, "0.0.0.0", "tidb server host")
+	advertiseAddress = flag.String(nmAdvertiseAddress, "", "tidb server advertise IP")
+	port             = flag.String(nmPort, "4000", "tidb server port")
+	cors             = flag.String(nmCors, "", "tidb server allow cors origin")
+	socket           = flag.String(nmSocket, "", "The socket file to use for connection.")
+	enableBinlog     = flagBoolean(nmEnableBinlog, false, "enable generate binlog")
+	runDDL           = flagBoolean(nmRunDDL, true, "run ddl worker on this tidb-server")
+	ddlLease         = flag.String(nmDdlLease, "45s", "schema lease duration, very dangerous to change only if you know what you do")
+	tokenLimit       = flag.Int(nmTokenLimit, 1000, "the limit of concurrent executed sessions")
 
 	// Log
 	logLevel     = flag.String(nmLogLevel, "info", "log level: info, debug, warn, error, fatal")
@@ -127,8 +131,8 @@ func main() {
 		fmt.Println(printer.GetTiDBInfo())
 		os.Exit(0)
 	}
-
 	registerStores()
+	registerMetrics()
 	loadConfig()
 	overrideConfig()
 	validateConfig()
@@ -137,27 +141,31 @@ func main() {
 	setupTracing() // Should before createServer and after setup config.
 	printInfo()
 	setupBinlogClient()
+	setupMetrics()
 	createStoreAndDomain()
 	createServer()
-	setupSignalHandler()
-	setupMetrics()
+	signal.SetupSignalHandler(serverShutdown)
 	runServer()
 	cleanup()
 	os.Exit(0)
 }
 
 func registerStores() {
-	err := session.RegisterStore("tikv", tikv.Driver{})
+	err := kvstore.Register("tikv", tikv.Driver{})
 	terror.MustNil(err)
 	tikv.NewGCHandlerFunc = gcworker.NewGCWorker
-	err = session.RegisterStore("mocktikv", mockstore.MockDriver{})
+	err = kvstore.Register("mocktikv", mockstore.MockDriver{})
 	terror.MustNil(err)
+}
+
+func registerMetrics() {
+	metrics.RegisterMetrics()
 }
 
 func createStoreAndDomain() {
 	fullPath := fmt.Sprintf("%s://%s", cfg.Store, cfg.Path)
 	var err error
-	storage, err = session.NewStore(fullPath)
+	storage, err = kvstore.New(fullPath)
 	terror.MustNil(err)
 	// Bootstrap a session to load information schema.
 	dom, err = session.BootstrapSession(storage)
@@ -165,22 +173,29 @@ func createStoreAndDomain() {
 }
 
 func setupBinlogClient() {
-	if cfg.BinlogSocket == "" {
+	if !cfg.Binlog.Enable {
 		return
 	}
-	dialerOpt := grpc.WithDialer(func(addr string, timeout time.Duration) (net.Conn, error) {
-		return net.DialTimeout("unix", addr, timeout)
+
+	if cfg.Binlog.IgnoreError {
+		binloginfo.SetIgnoreError(true)
+	}
+
+	client, err := pumpcli.NewPumpsClient(cfg.Path, parseDuration(cfg.Binlog.WriteTimeout), pd.SecurityOption{
+		CAPath:   cfg.Security.ClusterSSLCA,
+		CertPath: cfg.Security.ClusterSSLCert,
+		KeyPath:  cfg.Security.ClusterSSLKey,
 	})
-	clientConn, err := session.DialPumpClientWithRetry(cfg.BinlogSocket, util.DefaultMaxRetries, dialerOpt)
 	terror.MustNil(err)
-	binloginfo.SetPumpClient(binlog.NewPumpClient(clientConn))
-	log.Infof("created binlog client at %s", cfg.BinlogSocket)
+
+	binloginfo.SetPumpsClient(client)
+	log.Infof("create pumps client success, ignore binlog error %v", cfg.Binlog.IgnoreError)
 }
 
 // Prometheus push.
 const zeroDuration = time.Duration(0)
 
-// pushMetric pushs metircs in background.
+// pushMetric pushes metrics in background.
 func pushMetric(addr string, interval time.Duration) {
 	if interval == zeroDuration || len(addr) == 0 {
 		log.Info("disable Prometheus push client")
@@ -190,7 +205,7 @@ func pushMetric(addr string, interval time.Duration) {
 	go prometheusPushClient(addr, interval)
 }
 
-// prometheusPushClient pushs metrics to Prometheus Pushgateway.
+// prometheusPushClient pushes metrics to Prometheus Pushgateway.
 func prometheusPushClient(addr string, interval time.Duration) {
 	// TODO: TiDB do not have uniq name, so we use host+port to compose a name.
 	job := "tidb"
@@ -259,12 +274,19 @@ func overrideConfig() {
 	if actualFlags[nmHost] {
 		cfg.Host = *host
 	}
+	if actualFlags[nmAdvertiseAddress] {
+		cfg.AdvertiseAddress = *advertiseAddress
+	}
 	var err error
 	if actualFlags[nmPort] {
 		var p int
 		p, err = strconv.Atoi(*port)
 		terror.MustNil(err)
 		cfg.Port = uint(p)
+	}
+	if actualFlags[nmCors] {
+		fmt.Println(cors)
+		cfg.Cors = *cors
 	}
 	if actualFlags[nmStore] {
 		cfg.Store = *store
@@ -275,8 +297,8 @@ func overrideConfig() {
 	if actualFlags[nmSocket] {
 		cfg.Socket = *socket
 	}
-	if actualFlags[nmBinlogSocket] {
-		cfg.BinlogSocket = *binlogSocket
+	if actualFlags[nmEnableBinlog] {
+		cfg.Binlog.Enable = *enableBinlog
 	}
 	if actualFlags[nmRunDDL] {
 		cfg.RunDDL = *runDDL
@@ -340,6 +362,10 @@ func validateConfig() {
 		log.Errorf("\"store\" should be in [%s] only", strings.Join(nameList, ", "))
 		os.Exit(-1)
 	}
+	if cfg.Store == "mocktikv" && cfg.RunDDL == false {
+		log.Errorf("can't disable DDL on mocktikv")
+		os.Exit(-1)
+	}
 	if cfg.Log.File.MaxSize > config.MaxLogFileSize {
 		log.Errorf("log max-size should not be larger than %d MB", config.MaxLogFileSize)
 		os.Exit(-1)
@@ -355,6 +381,11 @@ func validateConfig() {
 		log.Errorf("lower-case-table-names should be 0 or 1 or 2.")
 		os.Exit(-1)
 	}
+
+	if cfg.TxnLocalLatches.Enabled && cfg.TxnLocalLatches.Capacity == 0 {
+		log.Errorf("txn-local-latches.capacity can not be 0")
+		os.Exit(-1)
+	}
 }
 
 func setGlobalVars() {
@@ -366,29 +397,37 @@ func setGlobalVars() {
 	domain.RunAutoAnalyze = cfg.Performance.RunAutoAnalyze
 	statistics.FeedbackProbability = cfg.Performance.FeedbackProbability
 	statistics.MaxQueryFeedbackCount = int(cfg.Performance.QueryFeedbackLimit)
-	statistics.AutoAnalyzeRatio = cfg.Performance.AutoAnalyzeRatio
-	plan.RatioOfPseudoEstimate = cfg.Performance.PseudoEstimateRatio
+	statistics.RatioOfPseudoEstimate = cfg.Performance.PseudoEstimateRatio
 	ddl.RunWorker = cfg.RunDDL
 	ddl.EnableSplitTableRegion = cfg.SplitTable
-	session.SetCommitRetryLimit(cfg.Performance.RetryLimit)
-	plan.AllowCartesianProduct = cfg.Performance.CrossJoin
+	plannercore.AllowCartesianProduct = cfg.Performance.CrossJoin
 	privileges.SkipWithGrant = cfg.Security.SkipGrantTable
+	variable.ForcePriority = int32(mysql.Str2Priority(cfg.Performance.ForcePriority))
 
-	if cfg.PlanCache.Enabled {
-		plan.GlobalPlanCache = kvcache.NewShardedLRUCache(cfg.PlanCache.Capacity, cfg.PlanCache.Shards)
-	}
+	variable.SysVars[variable.TIDBMemQuotaQuery].Value = strconv.FormatInt(cfg.MemQuotaQuery, 10)
+	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
 
-	plan.PreparedPlanCacheEnabled = cfg.PreparedPlanCache.Enabled
-	if plan.PreparedPlanCacheEnabled {
-		plan.PreparedPlanCacheCapacity = cfg.PreparedPlanCache.Capacity
+	// For CI environment we default enable prepare-plan-cache.
+	plannercore.SetPreparedPlanCache(config.CheckTableBeforeDrop || cfg.PreparedPlanCache.Enabled)
+	if plannercore.PreparedPlanCacheEnabled() {
+		plannercore.PreparedPlanCacheCapacity = cfg.PreparedPlanCache.Capacity
+		plannercore.PreparedPlanCacheMemoryGuardRatio = cfg.PreparedPlanCache.MemoryGuardRatio
+		if plannercore.PreparedPlanCacheMemoryGuardRatio < 0.0 || plannercore.PreparedPlanCacheMemoryGuardRatio > 1.0 {
+			plannercore.PreparedPlanCacheMemoryGuardRatio = 0.1
+		}
+		plannercore.PreparedPlanCacheMaxMemory = cfg.Performance.MaxMemory
+		total, err := memory.MemTotal()
+		terror.MustNil(err)
+		if plannercore.PreparedPlanCacheMaxMemory > total || plannercore.PreparedPlanCacheMaxMemory <= 0 {
+			plannercore.PreparedPlanCacheMaxMemory = total
+		}
 	}
 
 	if cfg.TiKVClient.GrpcConnectionCount > 0 {
 		tikv.MaxConnectionCount = cfg.TiKVClient.GrpcConnectionCount
 	}
-
-	// set lower_case_table_names
-	variable.SysVars["lower_case_table_names"].Value = strconv.Itoa(cfg.LowerCaseTableNames)
+	tikv.GrpcKeepAliveTime = time.Duration(cfg.TiKVClient.GrpcKeepAliveTime) * time.Second
+	tikv.GrpcKeepAliveTimeout = time.Duration(cfg.TiKVClient.GrpcKeepAliveTimeout) * time.Second
 
 	tikv.CommitMaxBackoff = int(parseDuration(cfg.TiKVClient.CommitTimeout).Seconds() * 1000)
 }
@@ -411,7 +450,8 @@ func createServer() {
 	driver = server.NewTiDBDriver(storage)
 	var err error
 	svr, err = server.NewServer(cfg, driver)
-	terror.MustNil(err)
+	// Both domain and storage have started, so we have to clean them before exiting.
+	terror.MustNil(err, closeDomainAndStorage)
 	if cfg.XProtocol.XServer {
 		xcfg := &xserver.Config{
 			Addr:       fmt.Sprintf("%s:%d", cfg.XProtocol.XHost, cfg.XProtocol.XPort),
@@ -419,33 +459,23 @@ func createServer() {
 			TokenLimit: cfg.TokenLimit,
 		}
 		xsvr, err = xserver.NewServer(xcfg)
-		terror.MustNil(err)
+		terror.MustNil(err, closeDomainAndStorage)
 	}
 }
 
-func setupSignalHandler() {
-	sc := make(chan os.Signal, 1)
-	signal.Notify(sc,
-		syscall.SIGHUP,
-		syscall.SIGINT,
-		syscall.SIGTERM,
-		syscall.SIGQUIT)
-
-	go func() {
-		sig := <-sc
-		log.Infof("Got signal [%s] to exit.", sig)
-		if sig == syscall.SIGTERM {
-			graceful = true
-		}
-
-		if xsvr != nil {
-			xsvr.Close() // Should close xserver before server.
-		}
-		svr.Close()
-	}()
+func serverShutdown(isgraceful bool) {
+	if isgraceful {
+		graceful = true
+	}
+	if xsvr != nil {
+		xsvr.Close() // Should close xserver before server.
+	}
+	svr.Close()
 }
 
 func setupMetrics() {
+	// Enable the mutex profile, 1/10 of mutex blocking event sampling.
+	runtime.SetMutexProfileFraction(10)
 	systimeErrHandler := func() {
 		metrics.TimeJumpBackCounter.Inc()
 	}
@@ -456,11 +486,20 @@ func setupMetrics() {
 		if callBackCount >= 5 {
 			callBackCount = 0
 			metrics.KeepAliveCounter.Inc()
+			updateCPUUsageMetrics()
 		}
 	}
 	go systimemon.StartMonitor(time.Now, systimeErrHandler, sucessCallBack)
 
 	pushMetric(cfg.Status.MetricsAddr, time.Duration(cfg.Status.MetricsInterval)*time.Second)
+}
+
+func updateCPUUsageMetrics() {
+	sysInfo, err := pidusage.GetStat(os.Getpid())
+	if err != nil {
+		return
+	}
+	metrics.CPUUsagePercentageGauge.Set(sysInfo.CPU)
 }
 
 func setupTracing() {
@@ -481,11 +520,17 @@ func runServer() {
 	}
 }
 
-func cleanup() {
-	if graceful {
-		svr.GracefulDown()
-	}
+func closeDomainAndStorage() {
 	dom.Close()
 	err := storage.Close()
 	terror.Log(errors.Trace(err))
+}
+
+func cleanup() {
+	if graceful {
+		svr.GracefulDown()
+	} else {
+		svr.KillAllConnections()
+	}
+	closeDomainAndStorage()
 }
